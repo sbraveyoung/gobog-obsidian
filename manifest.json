@@ -1,0 +1,10 @@
+{
+  "id": "gobog-publisher",
+  "name": "Gobog Publisher",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Publish a folder of your Obsidian vault as a static blog (powered by gobog) and push it to GitHub Pages.",
+  "author": "smart",
+  "authorUrl": "https://github.com/sbraveyoung/gobog",
+  "isDesktopOnly": true
+}
