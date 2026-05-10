@@ -1,10 +1,10 @@
 {
-  "id": "gobog-publisher",
-  "name": "Gobog Publisher",
-  "version": "0.1.0",
+  "id": "gobog-obsidian",
+  "name": "Gobog Sync",
+  "version": "0.2.0",
   "minAppVersion": "1.4.0",
-  "description": "Publish a folder of your Obsidian vault as a static blog (powered by gobog) and push it to GitHub Pages.",
-  "author": "smart",
+  "description": "Two-way sync between an Obsidian folder and a GitHub markdown repo, with auto front-matter for new notes. Companion to the gobog blog engine.",
+  "author": "sbraveyoung",
   "authorUrl": "https://github.com/sbraveyoung/gobog",
   "isDesktopOnly": true
 }

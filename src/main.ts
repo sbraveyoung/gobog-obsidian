@@ -5,270 +5,328 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  TAbstractFile,
+  TFile,
   TFolder,
 } from "obsidian";
 import * as path from "path";
 import * as fs from "fs";
-import * as os from "os";
-import { runGobogExport } from "./gobog";
-import { syncToGitHub } from "./git";
+import { gitPull, gitPushAll, gitInitIfMissing, gitStatusSummary } from "./git";
+import { ensureFrontMatter, generateId, FrontMatterDefaults } from "./frontmatter";
 
-export interface GobogPublisherSettings {
-  gobogBinPath: string;
-  sourceFolder: string;
-  themePath: string;
-  outputDir: string;
+export interface GobogObsidianSettings {
+  /** Path inside the vault (relative) that mirrors the blog repo. */
+  blogFolder: string;
 
-  domain: string;
-  blogTitle: string;
-  blogSubtitle: string;
-  blogDescription: string;
-  blogAuthor: string;
-  cname: string;
-  includeDrafts: boolean;
-
+  /** HTTPS URL of the blog markdown repo (e.g. https://github.com/sbraveyoung/blog.git). */
   repoUrl: string;
+  /** Branch to track. Default "master" matches the existing blog repo. */
   branch: string;
-  commitTemplate: string;
+  /** Personal Access Token. Stored locally in this plugin's data.json. */
   githubToken: string;
+  /** Git author shown in commits made by this plugin. */
   gitName: string;
   gitEmail: string;
-  forcePush: boolean;
+
+  /** Front-matter defaults used when auto-filling new notes. */
+  defaultAuthor: string;
+  /** Pattern for the auto-generated url. {{id}} is replaced. */
+  urlPattern: string;
+
+  /** Pull from remote on plugin load (catches changes from elsewhere). */
+  autoPullOnStart: boolean;
+  /** Push automatically after a save (debounced). */
+  autoPushOnSave: boolean;
+  /** Auto-push debounce in seconds. */
+  autoPushDebounceSec: number;
+  /** Auto-fill front-matter on file create. */
+  autoFrontMatter: boolean;
+
+  /** Commit message template. Supports {{date}}, {{count}}, {{paths}}. */
+  commitTemplate: string;
 }
 
-const DEFAULT_SETTINGS: GobogPublisherSettings = {
-  gobogBinPath: "gobog",
-  sourceFolder: "Blog",
-  themePath: "",
-  outputDir: "",
-
-  domain: "",
-  blogTitle: "",
-  blogSubtitle: "",
-  blogDescription: "",
-  blogAuthor: "",
-  cname: "",
-  includeDrafts: false,
+const DEFAULTS: GobogObsidianSettings = {
+  blogFolder: "Blog",
 
   repoUrl: "",
-  branch: "main",
-  commitTemplate: "Publish from Obsidian: {{date}}",
+  branch: "master",
   githubToken: "",
   gitName: "",
   gitEmail: "",
-  forcePush: false,
+
+  defaultAuthor: "sbraveyoung",
+  urlPattern: "/post/{{id}}",
+
+  autoPullOnStart: true,
+  autoPushOnSave: false,
+  autoPushDebounceSec: 30,
+  autoFrontMatter: true,
+
+  commitTemplate: "obsidian sync: {{count}} file(s) at {{date}}",
 };
 
-export default class GobogPublisherPlugin extends Plugin {
-  settings: GobogPublisherSettings = DEFAULT_SETTINGS;
+export default class GobogObsidianPlugin extends Plugin {
+  settings: GobogObsidianSettings = DEFAULTS;
+  /** Pending push debounce timer. Reset on every save while the plugin is auto-pushing. */
+  private pushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Status-bar element so the user can glance at sync state. */
+  private statusEl: HTMLElement | null = null;
 
   async onload() {
     await this.loadSettings();
 
-    this.addCommand({
-      id: "publish",
-      name: "Publish blog to GitHub",
-      callback: () => this.publish().catch((e) => this.fail(e)),
-    });
+    this.statusEl = this.addStatusBarItem();
+    this.statusEl.setText("gobog: idle");
 
     this.addCommand({
-      id: "export-only",
-      name: "Export to local folder (skip git push)",
-      callback: () => this.exportOnly().catch((e) => this.fail(e)),
+      id: "sync-pull",
+      name: "Pull blog repo (fetch latest)",
+      callback: () => this.runPull().catch((e) => this.fail(e)),
+    });
+    this.addCommand({
+      id: "sync-push",
+      name: "Push blog repo (commit + push local changes)",
+      callback: () => this.runPush().catch((e) => this.fail(e)),
+    });
+    this.addCommand({
+      id: "sync-status",
+      name: "Show blog repo sync status",
+      callback: () => this.runStatus().catch((e) => this.fail(e)),
+    });
+    this.addCommand({
+      id: "frontmatter-fill",
+      name: "Fill front matter for the active file",
+      checkCallback: (checking) => {
+        const f = this.app.workspace.getActiveFile();
+        const ok = !!(f && this.isInsideBlogFolder(f.path));
+        if (!ok) return false;
+        if (!checking) this.fillFrontMatterForFile(f!).catch((e) => this.fail(e));
+        return true;
+      },
     });
 
     this.addSettingTab(new GobogSettingTab(this.app, this));
+
+    // Hooks. We register through this.registerEvent so they're cleaned up
+    // automatically on plugin unload — Obsidian leaks event handlers
+    // otherwise.
+    if (this.settings.autoFrontMatter) {
+      this.registerEvent(
+        this.app.vault.on("create", (file) => this.onCreate(file).catch((e) => this.fail(e))),
+      );
+    }
+    if (this.settings.autoPushOnSave) {
+      this.registerEvent(
+        this.app.vault.on("modify", (file) => this.onModify(file)),
+      );
+    }
+
+    // First-run pull. Deferred slightly so the workspace is ready and
+    // any vault.on("create") events from initial scan have settled.
+    if (this.settings.autoPullOnStart && this.settings.repoUrl.trim()) {
+      this.app.workspace.onLayoutReady(() => {
+        this.runPull().catch((e) => this.fail(e));
+      });
+    }
   }
 
   async loadSettings() {
-    this.settings = Object.assign(
-      {},
-      DEFAULT_SETTINGS,
-      await this.loadData(),
-    );
+    this.settings = Object.assign({}, DEFAULTS, await this.loadData());
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
 
-  /**
-   * Resolve the absolute filesystem path of the configured source folder.
-   * Throws if the folder is missing — the user gets a clear error rather
-   * than gobog scanning an empty directory.
-   */
-  resolveSourcePath(): string {
+  /** Absolute filesystem path of the configured blog folder inside the vault. */
+  private blogFolderAbs(): string {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) {
-      throw new Error("Vault is not on local disk; this plugin is desktop-only.");
+      throw new Error("Vault must be on local disk; this plugin is desktop-only.");
     }
-    const vaultRoot = adapter.getBasePath();
-    const folderRel = this.settings.sourceFolder.trim();
-    if (!folderRel) {
-      throw new Error(
-        "sourceFolder is empty — set it in the plugin settings " +
-          '(e.g. "Blog" for a folder at the vault root).',
-      );
+    const rel = this.settings.blogFolder.trim();
+    if (!rel) {
+      throw new Error("Blog folder is empty — set it in plugin settings (e.g. \"Blog\").");
     }
-    const abs = path.resolve(vaultRoot, folderRel);
-    const stat = fs.statSync(abs);
-    if (!stat.isDirectory()) {
-      throw new Error(`source path is not a directory: ${abs}`);
-    }
-
-    // Sanity: the source must live under the vault. Stops users from
-    // accidentally pointing at /etc.
-    const rel = path.relative(vaultRoot, abs);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) {
-      throw new Error(
-        `source folder ${abs} is outside the vault — refuse to scan.`,
-      );
-    }
-
-    const folderHandle = this.app.vault.getAbstractFileByPath(folderRel);
-    if (folderHandle && !(folderHandle instanceof TFolder)) {
-      throw new Error(`${folderRel} exists in the vault but is not a folder.`);
-    }
+    const abs = path.resolve(adapter.getBasePath(), rel);
+    fs.mkdirSync(abs, { recursive: true });
     return abs;
   }
 
-  /**
-   * Resolve the absolute path where gobog should write the static site.
-   * Defaults to `<plugin data dir>/build` so we don't leak files into
-   * the user's vault tree.
-   */
-  resolveOutputDir(): string {
-    if (this.settings.outputDir.trim()) {
-      return path.resolve(this.settings.outputDir.trim());
-    }
-    const adapter = this.app.vault.adapter as FileSystemAdapter;
-    const dataDir = path.join(
-      adapter.getBasePath(),
-      this.app.vault.configDir,
-      "plugins",
-      this.manifest.id,
-      "build",
-    );
-    return dataDir;
+  /** True if a vault path is under the configured blog folder. */
+  private isInsideBlogFolder(vaultPath: string): boolean {
+    const folder = this.settings.blogFolder.trim().replace(/\/+$/, "");
+    if (!folder) return false;
+    return vaultPath === folder || vaultPath.startsWith(folder + "/");
   }
 
-  /**
-   * Build a temporary gobog config TOML pointing at the absolute source
-   * path. We don't mutate the user's existing config.toml (if any).
-   */
-  writeTempConfig(sourceAbs: string): string {
-    const themeAbs = this.settings.themePath.trim()
-      ? path.resolve(this.settings.themePath.trim())
-      : path.resolve(path.dirname(this.settings.gobogBinPath), "themes", "simple");
-
-    const escape = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    const lines = [
-      `[blog]`,
-      `domain = "${escape(this.settings.domain)}"`,
-      `title = "${escape(this.settings.blogTitle)}"`,
-      `subtitle = "${escape(this.settings.blogSubtitle)}"`,
-      `description = "${escape(this.settings.blogDescription)}"`,
-      `author = "${escape(this.settings.blogAuthor)}"`,
-      `theme = "${escape(themeAbs)}"`,
-      `source = "${escape(sourceAbs)}"`,
-      `cname = "${escape(this.settings.cname)}"`,
-      `include_drafts = ${this.settings.includeDrafts ? "true" : "false"}`,
-      ``,
-      `[http]`,
-      `addr = ""`,
-      `addrs = ""`,
-      `redirect_tls = false`,
-      ``,
-    ];
-
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gobog-"));
-    const cfgPath = path.join(tmpDir, "gobog.toml");
-    fs.writeFileSync(cfgPath, lines.join("\n"), "utf8");
-    return cfgPath;
+  /** vault.on("create") handler: stamp front matter on new notes. */
+  private async onCreate(file: TAbstractFile) {
+    if (!(file instanceof TFile)) return;
+    if (file.extension !== "md") return;
+    if (!this.isInsideBlogFolder(file.path)) return;
+    // Notes inside pages/ get a different url pattern (top-level slug).
+    await this.fillFrontMatterForFile(file);
   }
 
-  async exportOnly() {
-    const src = this.resolveSourcePath();
-    const out = this.resolveOutputDir();
-    new Notice(`gobog: scanning ${src}…`);
-    const cfg = this.writeTempConfig(src);
-    try {
-      await runGobogExport({
-        gobogBin: this.settings.gobogBinPath,
-        configPath: cfg,
-        outputDir: out,
-      });
-      new Notice(`gobog: export complete → ${out}`, 8000);
-    } finally {
-      try {
-        fs.rmSync(path.dirname(cfg), { recursive: true, force: true });
-      } catch (_) {
-        /* best-effort */
-      }
+  /** vault.on("modify") handler: schedule a debounced auto-push. */
+  private onModify(file: TAbstractFile) {
+    if (!(file instanceof TFile)) return;
+    if (!this.isInsideBlogFolder(file.path)) return;
+    if (!this.settings.autoPushOnSave) return;
+    if (this.pushTimer) clearTimeout(this.pushTimer);
+    this.setStatus(`gobog: push scheduled in ${this.settings.autoPushDebounceSec}s`);
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = null;
+      this.runPush().catch((e) => this.fail(e));
+    }, Math.max(1, this.settings.autoPushDebounceSec) * 1000);
+  }
+
+  /** Fill in title / author / id / url / create_time / updated_time. */
+  async fillFrontMatterForFile(file: TFile) {
+    const abs = path.join(this.blogFolderAbs(), this.relPathInBlog(file.path));
+    if (!fs.existsSync(abs)) return; // file may have been moved/deleted
+    const isPage = this.relPathInBlog(file.path).startsWith("pages/");
+    const basename = path.basename(file.path, ".md");
+    const id = generateId();
+    const url = isPage ? "/" + slugify(basename) : this.settings.urlPattern.replace(/\{\{id\}\}/g, id);
+    const defaults: FrontMatterDefaults = {
+      title: basename,
+      author: this.settings.defaultAuthor,
+      id,
+      url,
+      create_time: nowStamp(),
+      updated_time: nowStamp(),
+    };
+    const before = fs.readFileSync(abs, "utf8");
+    const after = ensureFrontMatter(before, defaults);
+    if (after !== before) {
+      fs.writeFileSync(abs, after, "utf8");
+      this.setStatus(`gobog: filled front matter on ${file.path}`);
     }
   }
 
-  async publish() {
+  /** Vault-relative path → blog-folder-relative path. */
+  private relPathInBlog(vaultPath: string): string {
+    const folder = this.settings.blogFolder.trim().replace(/\/+$/, "");
+    if (!folder) return vaultPath;
+    if (vaultPath === folder) return "";
+    return vaultPath.slice(folder.length + 1);
+  }
+
+  // ---------- sync commands ----------
+
+  async runPull() {
+    this.requireRepoConfigured();
+    const dir = this.blogFolderAbs();
+    this.setStatus("gobog: pulling…");
+    await gitInitIfMissing(dir, this.settings.repoUrl, this.settings.branch, this.settings.githubToken);
+    await gitPull(dir, this.settings.branch, this.settings.repoUrl, this.settings.githubToken);
+    new Notice("gobog: pulled latest from blog repo");
+    this.setStatus("gobog: idle");
+  }
+
+  async runPush() {
+    this.requireRepoConfigured();
+    const dir = this.blogFolderAbs();
+    this.setStatus("gobog: pushing…");
+    await gitInitIfMissing(dir, this.settings.repoUrl, this.settings.branch, this.settings.githubToken);
+    const summary = await gitStatusSummary(dir);
+    if (summary.changedCount === 0) {
+      new Notice("gobog: nothing to push");
+      this.setStatus("gobog: idle");
+      return;
+    }
+    const msg = renderCommitMessage(this.settings.commitTemplate, summary);
+    await gitPushAll(dir, {
+      branch: this.settings.branch,
+      remoteUrl: this.settings.repoUrl,
+      token: this.settings.githubToken,
+      authorName: this.settings.gitName.trim() || this.settings.defaultAuthor || "obsidian",
+      authorEmail: this.settings.gitEmail.trim() || "obsidian@users.noreply.github.com",
+      commitMessage: msg,
+    });
+    new Notice(`gobog: pushed ${summary.changedCount} file(s)`);
+    this.setStatus("gobog: idle");
+  }
+
+  async runStatus() {
+    this.requireRepoConfigured();
+    const dir = this.blogFolderAbs();
+    const summary = await gitStatusSummary(dir);
+    const text =
+      summary.changedCount === 0
+        ? "gobog: clean (no local changes)"
+        : `gobog: ${summary.changedCount} change(s) — ${summary.changedPaths.slice(0, 4).join(", ")}` +
+          (summary.changedPaths.length > 4 ? "…" : "");
+    new Notice(text, 8000);
+    this.setStatus(text);
+  }
+
+  private requireRepoConfigured() {
     if (!this.settings.repoUrl.trim()) {
-      throw new Error("repoUrl is empty — set the GitHub repository in plugin settings.");
+      throw new Error("Set the Repository URL in Settings → Gobog Sync.");
     }
     if (!this.settings.githubToken.trim()) {
-      throw new Error(
-        "githubToken is empty — paste a Personal Access Token (Fine-grained, contents: read+write).",
-      );
-    }
-
-    const src = this.resolveSourcePath();
-    const out = this.resolveOutputDir();
-    new Notice(`gobog: scanning ${src}…`);
-
-    const cfg = this.writeTempConfig(src);
-    try {
-      await runGobogExport({
-        gobogBin: this.settings.gobogBinPath,
-        configPath: cfg,
-        outputDir: out,
-      });
-      new Notice("gobog: export complete, pushing to GitHub…");
-
-      await syncToGitHub({
-        siteDir: out,
-        repoUrl: this.settings.repoUrl.trim(),
-        branch: this.settings.branch.trim() || "main",
-        token: this.settings.githubToken.trim(),
-        commitMessage: renderCommitMessage(this.settings.commitTemplate),
-        authorName: this.settings.gitName.trim() || "gobog-publisher",
-        authorEmail:
-          this.settings.gitEmail.trim() || "gobog-publisher@users.noreply.github.com",
-        forcePush: this.settings.forcePush,
-      });
-      new Notice("gobog: published 🚀", 8000);
-    } finally {
-      try {
-        fs.rmSync(path.dirname(cfg), { recursive: true, force: true });
-      } catch (_) {
-        /* best-effort */
-      }
+      throw new Error("Set the GitHub token in Settings → Gobog Sync.");
     }
   }
 
-  fail(err: unknown) {
-    console.error("[gobog-publisher]", err);
+  private setStatus(s: string) {
+    if (this.statusEl) this.statusEl.setText(s);
+  }
+
+  private fail(err: unknown) {
+    console.error("[gobog-sync]", err);
     const msg = err instanceof Error ? err.message : String(err);
     new Notice(`gobog: ${msg}`, 12000);
+    this.setStatus(`gobog: error — ${msg}`);
   }
 }
 
-function renderCommitMessage(tpl: string): string {
-  const now = new Date();
-  const iso = now.toISOString().replace(/\.\d+Z$/, "Z");
-  return tpl.replace(/\{\{date\}\}/g, iso).replace(/\{\{timestamp\}\}/g, String(now.getTime()));
+function nowStamp(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    d.getFullYear() +
+    "-" + pad(d.getMonth() + 1) +
+    "-" + pad(d.getDate()) +
+    " " + pad(d.getHours()) +
+    ":" + pad(d.getMinutes()) +
+    ":" + pad(d.getSeconds())
+  );
+}
+
+/** Slugify for page URLs — kebab-case ASCII; non-ASCII falls back to a hash. */
+function slugify(s: string): string {
+  const out = s
+    .toLowerCase()
+    .replace(/[^a-z0-9-_ .]/g, "")
+    .replace(/[\s._]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (out) return out;
+  // Hash CJK-only inputs to a stable hex.
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h).toString(16);
+}
+
+function renderCommitMessage(
+  tpl: string,
+  summary: { changedCount: number; changedPaths: string[] },
+): string {
+  const iso = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  return tpl
+    .replace(/\{\{date\}\}/g, iso)
+    .replace(/\{\{count\}\}/g, String(summary.changedCount))
+    .replace(/\{\{paths\}\}/g, summary.changedPaths.slice(0, 4).join(", "));
 }
 
 class GobogSettingTab extends PluginSettingTab {
-  plugin: GobogPublisherPlugin;
-
-  constructor(app: App, plugin: GobogPublisherPlugin) {
+  plugin: GobogObsidianPlugin;
+  constructor(app: App, plugin: GobogObsidianPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -277,106 +335,32 @@ class GobogSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "gobog binary" });
+    containerEl.createEl("h2", { text: "Vault" });
 
     new Setting(containerEl)
-      .setName("gobog binary path")
+      .setName("Blog folder")
       .setDesc(
-        'Absolute path to the gobog executable. Build it from the gobog repo with "make build" and point here.',
-      )
-      .addText((t) =>
-        t
-          .setPlaceholder("/usr/local/bin/gobog")
-          .setValue(this.plugin.settings.gobogBinPath)
-          .onChange(async (v) => {
-            this.plugin.settings.gobogBinPath = v;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Theme path")
-      .setDesc(
-        'Absolute path to a gobog theme directory (must contain index.html and post.html). ' +
-          'Leave blank to use "<gobog-bin-dir>/themes/simple".',
-      )
-      .addText((t) =>
-        t
-          .setPlaceholder("/path/to/gobog/themes/simple")
-          .setValue(this.plugin.settings.themePath)
-          .onChange(async (v) => {
-            this.plugin.settings.themePath = v;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    containerEl.createEl("h2", { text: "Vault source" });
-
-    new Setting(containerEl)
-      .setName("Source folder")
-      .setDesc(
-        'Path inside this vault that holds the notes you want to publish. ' +
-          'For example "Blog" or "Public/Notes". Everything in this folder ' +
-          "(and subfolders) becomes a post; nothing outside it is touched.",
+        "Path inside this vault that mirrors the blog repo (e.g. \"Blog\"). " +
+          "Everything in this folder gets pushed; nothing outside it is touched.",
       )
       .addText((t) =>
         t
           .setPlaceholder("Blog")
-          .setValue(this.plugin.settings.sourceFolder)
+          .setValue(this.plugin.settings.blogFolder)
           .onChange(async (v) => {
-            this.plugin.settings.sourceFolder = v;
+            this.plugin.settings.blogFolder = v;
             await this.plugin.saveSettings();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("Output directory")
-      .setDesc(
-        "Where gobog writes the static site before pushing. Default: " +
-          "<vault>/.obsidian/plugins/gobog-publisher/build",
-      )
-      .addText((t) =>
-        t
-          .setPlaceholder("(default)")
-          .setValue(this.plugin.settings.outputDir)
-          .onChange(async (v) => {
-            this.plugin.settings.outputDir = v;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Include drafts")
-      .setDesc('Include notes with "draft: true" in their front-matter.')
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.includeDrafts).onChange(async (v) => {
-          this.plugin.settings.includeDrafts = v;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    containerEl.createEl("h2", { text: "Site metadata" });
-
-    this.textSetting(containerEl, "Domain", "https://example.com", "domain");
-    this.textSetting(containerEl, "Title", "My Blog", "blogTitle");
-    this.textSetting(containerEl, "Subtitle", "Notes from Obsidian", "blogSubtitle");
-    this.textSetting(containerEl, "Description", "What this blog is about", "blogDescription");
-    this.textSetting(containerEl, "Author", "Your Name", "blogAuthor");
-    this.textSetting(
-      containerEl,
-      "CNAME",
-      "example.com (custom domain — written to dist/CNAME)",
-      "cname",
-    );
-
-    containerEl.createEl("h2", { text: "GitHub" });
+    containerEl.createEl("h2", { text: "Git remote (blog markdown repo)" });
 
     new Setting(containerEl)
       .setName("Repository URL")
-      .setDesc("HTTPS URL of the target repo, e.g. https://github.com/user/user.github.io.git")
+      .setDesc("HTTPS URL, e.g. https://github.com/sbraveyoung/blog.git")
       .addText((t) =>
         t
-          .setPlaceholder("https://github.com/user/user.github.io.git")
+          .setPlaceholder("https://github.com/sbraveyoung/blog.git")
           .setValue(this.plugin.settings.repoUrl)
           .onChange(async (v) => {
             this.plugin.settings.repoUrl = v;
@@ -384,19 +368,23 @@ class GobogSettingTab extends PluginSettingTab {
           }),
       );
 
-    this.textSetting(containerEl, "Branch", "main", "branch");
-    this.textSetting(
-      containerEl,
-      "Commit message template",
-      "Supports {{date}} and {{timestamp}}",
-      "commitTemplate",
-    );
+    new Setting(containerEl)
+      .setName("Branch")
+      .addText((t) =>
+        t
+          .setPlaceholder("master")
+          .setValue(this.plugin.settings.branch)
+          .onChange(async (v) => {
+            this.plugin.settings.branch = v;
+            await this.plugin.saveSettings();
+          }),
+      );
 
     new Setting(containerEl)
       .setName("GitHub token")
       .setDesc(
-        "Personal Access Token with write access to the repo (Fine-grained: " +
-          "Contents = Read & Write). Stored locally in the plugin's data file.",
+        "Personal Access Token (Fine-grained) with Contents: Read & Write " +
+          "on the blog repo. Stored locally in this plugin's data.json.",
       )
       .addText((t) => {
         t.inputEl.type = "password";
@@ -408,37 +396,110 @@ class GobogSettingTab extends PluginSettingTab {
           });
       });
 
-    this.textSetting(containerEl, "Git author name", "Your Name", "gitName");
-    this.textSetting(containerEl, "Git author email", "you@example.com", "gitEmail");
+    new Setting(containerEl)
+      .setName("Git author name")
+      .addText((t) =>
+        t
+          .setPlaceholder("(blank → use default author)")
+          .setValue(this.plugin.settings.gitName)
+          .onChange(async (v) => {
+            this.plugin.settings.gitName = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+    new Setting(containerEl)
+      .setName("Git author email")
+      .addText((t) =>
+        t
+          .setPlaceholder("you@example.com")
+          .setValue(this.plugin.settings.gitEmail)
+          .onChange(async (v) => {
+            this.plugin.settings.gitEmail = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    containerEl.createEl("h2", { text: "Sync behavior" });
 
     new Setting(containerEl)
-      .setName("Force push")
-      .setDesc(
-        "Use --force when pushing. Useful if you want a single-commit history " +
-          "or rewrote the branch outside Obsidian. Off by default.",
-      )
+      .setName("Pull on plugin start")
+      .setDesc("Fetch + fast-forward when Obsidian opens this vault.")
       .addToggle((t) =>
-        t.setValue(this.plugin.settings.forcePush).onChange(async (v) => {
-          this.plugin.settings.forcePush = v;
+        t.setValue(this.plugin.settings.autoPullOnStart).onChange(async (v) => {
+          this.plugin.settings.autoPullOnStart = v;
           await this.plugin.saveSettings();
         }),
       );
-  }
 
-  private textSetting(
-    containerEl: HTMLElement,
-    name: string,
-    placeholder: string,
-    key: keyof GobogPublisherSettings,
-  ) {
-    new Setting(containerEl).setName(name).addText((t) =>
-      t
-        .setPlaceholder(placeholder)
-        .setValue(String(this.plugin.settings[key] ?? ""))
-        .onChange(async (v) => {
-          (this.plugin.settings as any)[key] = v;
+    new Setting(containerEl)
+      .setName("Auto-push on save")
+      .setDesc("Commit + push after every save, debounced. Off by default.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.autoPushOnSave).onChange(async (v) => {
+          this.plugin.settings.autoPushOnSave = v;
           await this.plugin.saveSettings();
         }),
-    );
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-push debounce (seconds)")
+      .addText((t) =>
+        t
+          .setValue(String(this.plugin.settings.autoPushDebounceSec))
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            if (!isNaN(n) && n > 0) {
+              this.plugin.settings.autoPushDebounceSec = n;
+              await this.plugin.saveSettings();
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Commit message template")
+      .setDesc("Supports {{date}}, {{count}}, {{paths}}.")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.commitTemplate)
+          .onChange(async (v) => {
+            this.plugin.settings.commitTemplate = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    containerEl.createEl("h2", { text: "Front matter defaults" });
+
+    new Setting(containerEl)
+      .setName("Auto-fill on file create")
+      .setDesc("When a new .md is created in the blog folder, prepend a YAML front matter block with title / author / id / url / create_time / updated_time.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.autoFrontMatter).onChange(async (v) => {
+          this.plugin.settings.autoFrontMatter = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Default author")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.defaultAuthor)
+          .onChange(async (v) => {
+            this.plugin.settings.defaultAuthor = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("URL pattern")
+      .setDesc("Used for posts. {{id}} is replaced with the auto-generated id.")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.urlPattern)
+          .onChange(async (v) => {
+            this.plugin.settings.urlPattern = v;
+            await this.plugin.saveSettings();
+          }),
+      );
   }
 }

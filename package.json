@@ -1,7 +1,7 @@
 {
-  "name": "gobog-publisher",
-  "version": "0.1.0",
-  "description": "Obsidian plugin: publish a vault folder to GitHub Pages via gobog.",
+  "name": "gobog-obsidian",
+  "version": "0.2.0",
+  "description": "Two-way sync between an Obsidian folder and a GitHub markdown repo, with auto front-matter for new notes. Companion to the gobog blog engine.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

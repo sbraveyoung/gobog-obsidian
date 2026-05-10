@@ -1,129 +1,163 @@
 import { spawn } from "child_process";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 
-export interface SyncOpts {
-  /** Local directory containing the rendered site (becomes the new tree). */
-  siteDir: string;
-  /** Repository HTTPS URL — must match https://github.com/<owner>/<repo>(.git)?. */
-  repoUrl: string;
-  /** Branch to publish to (created if missing). */
+/* git.ts — markdown source sync between the Obsidian vault folder and the
+ * blog repo on GitHub. The plugin runs `git` from PATH; we never bundle a
+ * Git implementation. The blog folder inside the vault becomes the working
+ * tree of a real Git repo whose remote is the user-configured GitHub URL.
+ */
+
+export interface PushOpts {
   branch: string;
-  /** Personal Access Token with contents:read+write on the repo. */
+  remoteUrl: string;
   token: string;
-  commitMessage: string;
   authorName: string;
   authorEmail: string;
-  /** When true, push with --force. */
-  forcePush: boolean;
+  commitMessage: string;
 }
 
-/**
- * Pushes the contents of siteDir to <repoUrl>:<branch>. Strategy:
- *
- *   1. Clone the branch (shallow) into a sibling temp dir. If the branch
- *      doesn't exist yet, init an empty repo there instead.
- *   2. Wipe everything under that working tree except .git.
- *   3. Copy siteDir over it.
- *   4. Stage, commit (skipping if there's nothing changed), push.
- *
- * The HTTPS URL is rewritten to embed the token via the standard
- * `https://x-access-token:<TOKEN>@github.com/...` form. We never log the
- * embedded URL.
- */
-export async function syncToGitHub(opts: SyncOpts): Promise<void> {
-  validate(opts);
+export interface StatusSummary {
+  changedCount: number;
+  changedPaths: string[];
+}
 
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "gobog-git-"));
+/** True when `dir` already contains a `.git` directory. */
+function isGitRepo(dir: string): boolean {
   try {
-    const remote = injectToken(opts.repoUrl, opts.token);
-    const safeRemote = redact(opts.repoUrl);
-
-    // Try to clone the existing branch shallowly. If that fails (branch
-    // missing / repo brand new), init from scratch and add the remote.
-    const cloned = await tryClone(remote, opts.branch, work);
-    if (!cloned) {
-      await git(["init", "-q", "-b", opts.branch], work);
-      await git(["remote", "add", "origin", remote], work);
-    }
-    await git(["config", "user.name", opts.authorName], work);
-    await git(["config", "user.email", opts.authorEmail], work);
-
-    await wipeWorkingTree(work);
-    await copyTree(opts.siteDir, work);
-
-    await git(["add", "-A"], work);
-    const dirty = await isDirty(work);
-    if (!dirty) {
-      console.log(`[gobog-publisher] nothing to push to ${safeRemote} (${opts.branch})`);
-      return;
-    }
-    await git(["commit", "-m", opts.commitMessage], work);
-    const pushArgs = ["push", "-u", "origin", opts.branch];
-    if (opts.forcePush) pushArgs.splice(1, 0, "--force");
-    await git(pushArgs, work);
-    console.log(`[gobog-publisher] pushed to ${safeRemote} (${opts.branch})`);
-  } finally {
-    try {
-      fs.rmSync(work, { recursive: true, force: true });
-    } catch (_) {
-      /* best-effort */
-    }
-  }
-}
-
-function validate(opts: SyncOpts) {
-  if (!/^https:\/\/[^\s]+/.test(opts.repoUrl)) {
-    throw new Error(`repoUrl must be an https URL, got: ${opts.repoUrl}`);
-  }
-  if (!opts.token) throw new Error("github token is empty");
-  if (!opts.branch) throw new Error("branch is empty");
-  if (!fs.existsSync(opts.siteDir)) {
-    throw new Error(`siteDir does not exist: ${opts.siteDir}`);
-  }
-}
-
-function injectToken(httpsUrl: string, token: string): string {
-  // https://github.com/foo/bar.git -> https://x-access-token:<TOKEN>@github.com/foo/bar.git
-  return httpsUrl.replace(
-    /^https:\/\//,
-    `https://x-access-token:${encodeURIComponent(token)}@`,
-  );
-}
-
-function redact(httpsUrl: string): string {
-  return httpsUrl.replace(/:\/\/[^@]+@/, "://<redacted>@");
-}
-
-async function tryClone(remote: string, branch: string, dest: string): Promise<boolean> {
-  try {
-    await git(
-      ["clone", "--depth", "1", "--branch", branch, "--single-branch", remote, "."],
-      dest,
-    );
-    return true;
+    return fs.statSync(path.join(dir, ".git")).isDirectory();
   } catch {
-    // Either the branch doesn't exist yet or the repo is empty — fall back
-    // to git init in the caller.
     return false;
   }
 }
 
-async function isDirty(cwd: string): Promise<boolean> {
-  const out = await gitOut(["status", "--porcelain"], cwd);
-  return out.trim().length > 0;
-}
-
-async function wipeWorkingTree(work: string) {
-  for (const entry of fs.readdirSync(work)) {
-    if (entry === ".git") continue;
-    fs.rmSync(path.join(work, entry), { recursive: true, force: true });
+/**
+ * Make sure `dir` is a git repo wired to the configured remote and on the
+ * configured branch. If `dir` already has a `.git`, only the remote URL
+ * (and optionally the current branch) is reconciled. If not, we
+ * `git init` + add the remote + `git fetch` so a subsequent `pull` can
+ * fast-forward.
+ *
+ * The token is injected into the remote URL at commit / push time, NOT
+ * persisted in `.git/config`, so the on-disk repo doesn't leak secrets.
+ */
+export async function gitInitIfMissing(
+  dir: string,
+  remoteUrl: string,
+  branch: string,
+  _token: string,
+): Promise<void> {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!isGitRepo(dir)) {
+    await git(["init", "-q", "-b", branch], dir);
+  }
+  // Ensure origin points at the user-configured URL (sans token).
+  const cleanUrl = remoteUrl.trim();
+  try {
+    await git(["remote", "set-url", "origin", cleanUrl], dir);
+  } catch {
+    await git(["remote", "add", "origin", cleanUrl], dir);
   }
 }
 
-async function copyTree(src: string, dst: string) {
-  await fs.promises.cp(src, dst, { recursive: true, errorOnExist: false, force: true });
+/**
+ * `git fetch && git merge --ff-only`. If the local branch doesn't exist
+ * yet (first sync against an existing remote), checkout origin/<branch>
+ * into a fresh tracking branch. If the local branch has unmerged work,
+ * surface a clear error rather than silently rebasing.
+ */
+export async function gitPull(
+  dir: string,
+  branch: string,
+  remoteUrl: string,
+  token: string,
+): Promise<void> {
+  const remote = withToken(remoteUrl, token);
+
+  // Fetch the branch from the tokenised URL but never persist the token.
+  // Use a one-shot fetch with the URL passed inline.
+  try {
+    await git(["fetch", "--depth=50", remote, branch], dir);
+  } catch (e) {
+    // If the branch doesn't exist on the remote yet, that's not fatal —
+    // the next push will create it. Otherwise rethrow.
+    const msg = String(e);
+    if (!/couldn't find remote ref|does not exist|not our ref/i.test(msg)) {
+      throw e;
+    }
+    return;
+  }
+
+  // Ensure local branch exists; if not, point it at FETCH_HEAD.
+  const branches = await gitOut(["branch", "--list", branch], dir);
+  if (branches.trim() === "") {
+    // No local branch yet — create one from FETCH_HEAD.
+    await git(["checkout", "-b", branch, "FETCH_HEAD"], dir);
+    return;
+  }
+
+  // We're on the right branch already? If not, switch.
+  const cur = (await gitOut(["rev-parse", "--abbrev-ref", "HEAD"], dir)).trim();
+  if (cur !== branch) {
+    await git(["checkout", branch], dir);
+  }
+
+  // Fast-forward merge from FETCH_HEAD. If FF isn't possible, we abort
+  // rather than rebasing — the user gets a Notice and can resolve.
+  try {
+    await git(["merge", "--ff-only", "FETCH_HEAD"], dir);
+  } catch (e) {
+    throw new Error(
+      "pull is not fast-forward — local commits diverge from origin/" +
+        branch +
+        ". Resolve manually (git rebase / merge) before retrying.",
+    );
+  }
+}
+
+/**
+ * Stage everything dirty, commit, push. No-op when status is clean.
+ * Tokenised remote URL is used inline in the push so it never lands in
+ * `.git/config`.
+ */
+export async function gitPushAll(dir: string, opts: PushOpts): Promise<void> {
+  // Author identity goes through git config (per-repo, not global).
+  await git(["config", "user.name", opts.authorName], dir);
+  await git(["config", "user.email", opts.authorEmail], dir);
+
+  await git(["add", "-A"], dir);
+
+  // Bail when nothing's actually staged.
+  const status = await gitOut(["status", "--porcelain"], dir);
+  if (status.trim() === "") return;
+
+  await git(["commit", "-m", opts.commitMessage], dir);
+
+  const remote = withToken(opts.remoteUrl, opts.token);
+  await git(["push", remote, "HEAD:" + opts.branch], dir);
+}
+
+/** `git status --porcelain` reduced to a count + sample paths. */
+export async function gitStatusSummary(dir: string): Promise<StatusSummary> {
+  if (!isGitRepo(dir)) return { changedCount: 0, changedPaths: [] };
+  const out = await gitOut(["status", "--porcelain"], dir);
+  const paths: string[] = [];
+  for (const line of out.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // status lines look like " M path" or "?? path"; drop the 2-char prefix.
+    paths.push(trimmed.slice(trimmed.indexOf(" ") + 1).trim());
+  }
+  return { changedCount: paths.length, changedPaths: paths };
+}
+
+/** Splice the GitHub PAT into an https URL just for one git invocation. */
+function withToken(httpsUrl: string, token: string): string {
+  if (!token) return httpsUrl;
+  return httpsUrl.replace(
+    /^https:\/\//,
+    `https://x-access-token:${encodeURIComponent(token)}@`,
+  );
 }
 
 function git(args: string[], cwd: string): Promise<void> {
@@ -137,17 +171,9 @@ function git(args: string[], cwd: string): Promise<void> {
     });
     child.once("error", reject);
     child.once("close", (code) => {
-      if (code === 0) resolve();
-      else
-        reject(
-          new Error(
-            `git ${args.join(" ")} exited with ${code}: ${stderr
-              .split("\n")
-              .filter(Boolean)
-              .slice(-3)
-              .join(" | ")}`,
-          ),
-        );
+      if (code === 0) return resolve();
+      const tail = stderr.split("\n").filter(Boolean).slice(-3).join(" | ");
+      reject(new Error(`git ${args[0]} exited ${code}: ${tail}`));
     });
   });
 }

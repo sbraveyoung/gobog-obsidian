@@ -1,98 +1,118 @@
-# Gobog Publisher
+# Gobog Sync
 
-Obsidian plugin: turn a folder of your vault into a static blog and push it to a GitHub Pages repository, in one command.
+Obsidian plugin: keeps a folder of your vault in sync with a GitHub markdown
+repo, two-way, and auto-fills front matter on new notes.
 
-This plugin is a thin orchestration layer. The actual scanning, markdown rendering, wikilink/embed resolution, atom/sitemap generation and static export are done by [`gobog`](https://github.com/sbraveyoung/gobog) — you must build that binary first.
+This is the editing-side companion to [`gobog`](https://github.com/sbraveyoung/gobog).
+Architecture in one picture:
 
 ```
-Obsidian vault              gobog binary                GitHub repo
-─────────────────  ─────►   ────────────  ────────►  ───────────────
-   Blog/                   gobog -export                user.github.io
-     Hello.md              <out>/                       index.html
-     Tech/                                              about/
-       HTTP.md                                          post/...
-     about/me.md                                        atom.xml ...
+Obsidian vault              GitHub repo                 GitHub Pages
+─────────────────  ◄────►   ───────────────  ─────►    ───────────────
+   Blog/                    sbraveyoung/blog            sbraveyoung.github.io
+     post/                  (markdown source)           (rendered HTML)
+     pages/                       │
+     resource/image/              │ workflow_dispatch
+                                  ▼
+                          sbraveyoung/gobog (renderer)
+                          builds + commits HTML to github.io
 ```
 
-The plugin never touches your notes — it always uses gobog's read-only vault adapter (`ParseFile`).
+What this plugin does:
+
+- **Pull** the blog repo into your vault folder (so your local Obsidian
+  matches GitHub — covers writing-from-another-machine and disaster
+  recovery).
+- **Push** local changes back to the repo (so writing in Obsidian also
+  updates the source-of-truth).
+- **Front-matter auto-fill**: when a new `.md` is created inside the blog
+  folder, the plugin prepends a YAML block with `title`, `author`, `id`,
+  `url`, `create_time`, `updated_time`. Existing front-matter is never
+  overwritten — only the missing keys are added.
+
+What this plugin doesn't do:
+
+- It doesn't render or publish HTML. That's the github.io repo's
+  workflow, which builds the gobog binary at deploy time.
+- It doesn't bundle git — uses the system `git` from `PATH`.
+- It doesn't work on mobile (Electron-only APIs).
 
 ## Requirements
 
-- Obsidian 1.4+ (desktop only — this plugin shells out to `gobog` and `git`).
-- A built `gobog` binary somewhere on disk. Build it from the [gobog repo](https://github.com/sbraveyoung/gobog):
-
-  ```sh
-  git clone https://github.com/sbraveyoung/gobog && cd gobog && make build
-  ```
-
+- Obsidian 1.4+ (desktop only).
 - `git` available on `PATH`.
-- A GitHub repository for the published site (typically `<user>.github.io`) and a Personal Access Token with `Contents: Read & Write` scoped to that repo.
+- A GitHub repository for the markdown source (e.g. `sbraveyoung/blog`)
+  and a Personal Access Token with `Contents: Read & Write` scoped to it.
 
 ## Install
 
-For now the plugin is not in the community store. Install manually:
+For now, manual install:
 
 ```sh
-git clone https://github.com/<you>/gobog-obsidian.git ~/.obsidian/plugins/gobog-publisher
-cd ~/.obsidian/plugins/gobog-publisher
+git clone https://github.com/sbraveyoung/gobog-obsidian.git \
+  <your-vault>/.obsidian/plugins/gobog-obsidian
+cd <your-vault>/.obsidian/plugins/gobog-obsidian
 npm install
 npm run build
 ```
 
-Then in Obsidian: Settings → Community plugins → enable "Gobog Publisher".
-
-(Replace `~/.obsidian/plugins` with `<your-vault>/.obsidian/plugins/` — the plugin is per-vault.)
+Then in Obsidian: Settings → Community plugins → enable "Gobog Sync".
 
 ## Configure
 
-Open Settings → Gobog Publisher and fill in:
+Open Settings → Gobog Sync.
 
 | Section | Field | Notes |
 | --- | --- | --- |
-| gobog binary | gobog binary path | Absolute path to the `gobog` executable. |
-| | Theme path | Absolute path to a theme dir (defaults to `<gobog-bin-dir>/themes/simple`). |
-| Vault source | Source folder | Path inside the vault that holds publishable notes (e.g. `Blog`). The folder boundary IS the publish boundary — no `publish: true` flag needed. |
-| | Output directory | Where gobog writes the static site before pushing. Defaults to `<vault>/.obsidian/plugins/gobog-publisher/build`. |
-| | Include drafts | Show notes with `draft: true` in the output. |
-| Site metadata | Domain / Title / Author / CNAME / etc. | Used for canonical URLs, atom feed, sitemap, and the optional `CNAME` file dropped into the export. |
-| GitHub | Repository URL | `https://github.com/<user>/<repo>.git` |
-| | Branch | `main` for `<user>.github.io`, often `gh-pages` for project sites. |
-| | GitHub token | Fine-grained PAT with Contents: Read & Write on the target repo. Stored locally in this plugin's `data.json`. |
-| | Force push | Off by default; turn on for single-commit history. |
+| Vault | Blog folder | Path inside the vault that mirrors the blog repo (e.g. `Blog`). |
+| Git remote | Repository URL | `https://github.com/<owner>/<repo>.git` |
+| | Branch | `master` for the existing blog repo. |
+| | GitHub token | Fine-grained PAT (Contents: Read & Write). Stored locally. |
+| | Git author name / email | Identity used for commits made by this plugin. |
+| Sync behavior | Pull on plugin start | Fast-forward your vault when Obsidian opens. Default on. |
+| | Auto-push on save | Commit + push automatically after every save (debounced). Default off. |
+| | Auto-push debounce | Seconds of quiet before the push fires. Default 30. |
+| | Commit template | Supports `{{date}}`, `{{count}}`, `{{paths}}`. |
+| Front matter | Auto-fill on create | Prepend a YAML block when a new note is created in the blog folder. |
+| | Default author | Used in the auto-filled `author:` field. |
+| | URL pattern | Used for posts. `{{id}}` is replaced with the auto-generated id. |
 
-## Use
+## Commands
 
-Command palette → **Gobog: Publish blog to GitHub**.
+Command palette:
 
-Steps the plugin performs:
+- **Gobog Sync: Pull blog repo** — fetch + fast-forward.
+- **Gobog Sync: Push blog repo** — commit local changes + push.
+- **Gobog Sync: Show sync status** — quick "clean / N changed files" notice.
+- **Gobog Sync: Fill front matter for the active file** — re-runs the
+  auto-fill on demand (useful for files that pre-date the plugin).
 
-1. Resolves the source folder to an absolute path (refuses anything outside the vault).
-2. Writes a temp `gobog.toml` reflecting the settings.
-3. Runs `gobog -config <temp> -export <out>`.
-4. Clones the target branch shallowly (or `git init`s when the branch doesn't exist), wipes the working tree, copies `<out>` over it, commits, pushes.
-5. Reports success in a Notice. Logs go to DevTools (Ctrl+Shift+I → Console).
+## Front matter contract
 
-There's also **Gobog: Export to local folder (skip git push)** if you just want the rendered static site without touching the remote.
+The auto-fill writes:
 
-## Wikilinks, embeds, tags
+```yaml
+---
+title: <basename of the file>
+author: <Default author setting>
+id: <8-char hex>
+url: /post/<id>          # for files under post/...
+                          # /<slug-of-basename> for files under pages/...
+create_time: 2026-05-09 12:34:56
+updated_time: 2026-05-09 12:34:56
+---
+```
 
-The transforms happen on the gobog side, not in this plugin. As a quick reference of what reaches the published site:
+The plugin never **rewrites** an existing key — only appends missing keys
+inside an existing `---` block. Touching a key by hand is always safe.
 
-- `[[Note]]` → `<a href="/post/.../note">Note</a>` (resolved against the source folder)
-- `[[Note|caption]]` → custom anchor text
-- `[[Note#section]]` → fragment appended (slugified)
-- `![[image.png]]` → `<img src="/image/<rel-path>">` — attachments may live anywhere in the source folder
-- `tags: [a, b]` (Obsidian YAML form) and `tags: a, b` both decode the same way
-- `draft: true` excludes the note unless "Include drafts" is on
+## Conflict handling
 
-Wikilinks pointing outside the source folder render as plain text — the source folder is intentionally a hard publish boundary.
-
-## What this plugin does NOT do
-
-- Does not edit your notes (gobog's vault scanner is read-only).
-- Does not bundle git — uses your system `git`.
-- Does not work on mobile (Electron-only APIs).
-- Does not handle Obsidian Canvas, Templater output, or Dataview queries.
+On `pull`, the plugin uses `merge --ff-only`. If your local branch has
+diverged (you committed locally and someone else pushed), the merge fails
+fast and you get a Notice asking you to resolve manually. The plugin
+deliberately doesn't auto-rebase — silent rewrites of vault files are
+exactly the kind of thing a sync plugin shouldn't do.
 
 ## License
 
