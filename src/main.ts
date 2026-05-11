@@ -1,6 +1,7 @@
 import {
   App,
   FileSystemAdapter,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -11,7 +12,16 @@ import {
 } from "obsidian";
 import * as path from "path";
 import * as fs from "fs";
-import { gitPull, gitPushAll, gitInitIfMissing, gitStatusSummary } from "./git";
+import * as os from "os";
+import { spawn } from "child_process";
+import {
+  gitPull,
+  gitCommitAndPush,
+  gitStageAndDiff,
+  gitResetStaged,
+  gitInitIfMissing,
+  gitStatusSummary,
+} from "./git";
 import { ensureFrontMatter, generateId, FrontMatterDefaults } from "./frontmatter";
 import { pushToWeChat, resetTokenCache } from "./wechat";
 
@@ -46,6 +56,18 @@ export interface GobogObsidianSettings {
   /** Commit message template. Supports {{date}}, {{count}}, {{paths}}. */
   commitTemplate: string;
 
+  /** Show a diff modal before every push and require explicit confirmation.
+   *  Applies to both manual and auto-push. Default on. */
+  confirmBeforePush: boolean;
+
+  // ---- Local preview (optional, needs gobog binary on disk) ----
+  /** Absolute path to a built gobog binary. When empty, the preview
+   *  command surfaces an instruction-only notice. */
+  gobogBinPath: string;
+  /** Absolute path to a gobog theme directory. Defaults to
+   *  <gobog-bin-dir>/themes/minimal. */
+  themePath: string;
+
   // ---- WeChat 公众号 (optional) ----
   wechatEnabled: boolean;
   wechatAppId: string;
@@ -75,6 +97,11 @@ const DEFAULTS: GobogObsidianSettings = {
   autoFrontMatter: true,
 
   commitTemplate: "obsidian sync: {{count}} file(s) at {{date}}",
+
+  confirmBeforePush: true,
+
+  gobogBinPath: "",
+  themePath: "",
 
   wechatEnabled: false,
   wechatAppId: "",
@@ -121,6 +148,16 @@ export default class GobogObsidianPlugin extends Plugin {
         if (!checking) this.fillFrontMatterForFile(f!).catch((e) => this.fail(e));
         return true;
       },
+    });
+
+    // Preview blog locally — runs the gobog binary against the blog
+    // folder, then opens the rendered HTML in the default browser. Needs
+    // a built gobog binary path; falls back to a helpful notice if the
+    // user hasn't configured one.
+    this.addCommand({
+      id: "preview-local",
+      name: "Preview blog locally (renders via gobog, opens in browser)",
+      callback: () => this.runLocalPreview().catch((e) => this.fail(e)),
     });
 
     // WeChat draft push — only enabled when wechatEnabled is true. The
@@ -264,7 +301,7 @@ export default class GobogObsidianPlugin extends Plugin {
   async runPush() {
     this.requireRepoConfigured();
     const dir = this.blogFolderAbs();
-    this.setStatus("gobog: pushing…");
+    this.setStatus("gobog: staging…");
     await gitInitIfMissing(dir, this.settings.repoUrl, this.settings.branch, this.settings.githubToken);
     const summary = await gitStatusSummary(dir);
     if (summary.changedCount === 0) {
@@ -272,17 +309,51 @@ export default class GobogObsidianPlugin extends Plugin {
       this.setStatus("gobog: idle");
       return;
     }
+
+    const authorName = this.settings.gitName.trim() || this.settings.defaultAuthor || "obsidian";
+    const authorEmail = this.settings.gitEmail.trim() || "obsidian@users.noreply.github.com";
+    const diff = await gitStageAndDiff(dir, authorName, authorEmail);
+    if (diff === null) {
+      // Race: status said dirty, but a sibling process cleaned up before us.
+      new Notice("gobog: nothing to push (cleaned up between status + stage)");
+      this.setStatus("gobog: idle");
+      return;
+    }
+
     const msg = renderCommitMessage(this.settings.commitTemplate, summary);
-    await gitPushAll(dir, {
+
+    // If diff-confirmation is on (default), show the modal and wait for
+    // the user. The Cancel path un-stages everything so the next save
+    // starts fresh.
+    let approved = true;
+    if (this.settings.confirmBeforePush) {
+      approved = await this.confirmDiff(diff, msg);
+    }
+    if (!approved) {
+      await gitResetStaged(dir);
+      new Notice("gobog: push cancelled");
+      this.setStatus("gobog: idle");
+      return;
+    }
+
+    this.setStatus("gobog: pushing…");
+    await gitCommitAndPush(dir, {
       branch: this.settings.branch,
       remoteUrl: this.settings.repoUrl,
       token: this.settings.githubToken,
-      authorName: this.settings.gitName.trim() || this.settings.defaultAuthor || "obsidian",
-      authorEmail: this.settings.gitEmail.trim() || "obsidian@users.noreply.github.com",
+      authorName,
+      authorEmail,
       commitMessage: msg,
     });
     new Notice(`gobog: pushed ${summary.changedCount} file(s)`);
     this.setStatus("gobog: idle");
+  }
+
+  /** Show the diff in a modal and resolve true on confirm, false on cancel. */
+  private confirmDiff(diff: string, commitMsg: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      new DiffConfirmModal(this.app, diff, commitMsg, resolve).open();
+    });
   }
 
   async runStatus() {
@@ -340,6 +411,146 @@ export default class GobogObsidianPlugin extends Plugin {
       14000,
     );
     this.setStatus("gobog: wechat draft submitted");
+  }
+
+  /**
+   * Render the blog folder with the local gobog binary and open the
+   * result in the system browser. Output goes to a temp dir under the
+   * plugin's data area (so we don't leak files into the vault tree).
+   *
+   * If the user has a post open and it's inside the blog folder, we
+   * try to open that specific post's rendered URL; otherwise we land
+   * on the home page.
+   */
+  async runLocalPreview() {
+    const bin = this.settings.gobogBinPath.trim();
+    if (!bin) {
+      throw new Error(
+        "Set the gobog binary path in Settings → Gobog Sync → Local preview. " +
+          "Build the binary in the gobog repo with `make build`.",
+      );
+    }
+    if (!fs.existsSync(bin)) {
+      throw new Error(`gobog binary not found at ${bin}`);
+    }
+    const sourceAbs = this.blogFolderAbs();
+    const themeAbs =
+      this.settings.themePath.trim() ||
+      path.resolve(path.dirname(bin), "themes", "minimal");
+    if (!fs.existsSync(themeAbs)) {
+      throw new Error(
+        `theme directory not found at ${themeAbs}. ` +
+          "Set Settings → Gobog Sync → Theme path to an existing theme dir.",
+      );
+    }
+
+    const previewDir = this.previewOutputDir();
+    fs.mkdirSync(previewDir, { recursive: true });
+    const cfgPath = this.writePreviewConfig(sourceAbs, themeAbs);
+
+    this.setStatus("gobog: rendering preview…");
+    try {
+      await this.spawnGobog(bin, cfgPath, previewDir);
+    } finally {
+      try { fs.rmSync(path.dirname(cfgPath), { recursive: true, force: true }); } catch (_) { /* best-effort */ }
+    }
+
+    const url = this.previewURL(previewDir);
+    new Notice(`gobog: preview ready → ${url}`, 10000);
+    this.setStatus("gobog: preview ready");
+
+    // Best-effort open via Obsidian's `window.open` which routes to the
+    // system default browser when given a file:// URL. Falls back to a
+    // notice with the path if it's blocked.
+    try {
+      window.open(url);
+    } catch (_) {
+      /* notice already shown */
+    }
+  }
+
+  private previewOutputDir(): string {
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    return path.join(
+      adapter.getBasePath(),
+      this.app.vault.configDir,
+      "plugins",
+      this.manifest.id,
+      "preview",
+    );
+  }
+
+  private writePreviewConfig(sourceAbs: string, themeAbs: string): string {
+    const escape = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const lines = [
+      `[blog]`,
+      `domain = "http://localhost"`,
+      `title = "preview"`,
+      `subtitle = ""`,
+      `description = ""`,
+      `author = "${escape(this.settings.defaultAuthor)}"`,
+      `theme = "${escape(themeAbs)}"`,
+      `source = "${escape(sourceAbs)}"`,
+      `include_drafts = true`,
+      `include_hidden = true`,
+      ``,
+      `[http]`,
+      `addr = ""`,
+      `addrs = ""`,
+      ``,
+      `[data]`,
+      `dir = "${escape(path.join(os.tmpdir(), "gobog-preview-data"))}"`,
+      ``,
+      `[comments]`,
+      `enabled = false`,
+      ``,
+    ];
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gobog-preview-cfg-"));
+    const cfgPath = path.join(tmp, "gobog.toml");
+    fs.writeFileSync(cfgPath, lines.join("\n"), "utf8");
+    return cfgPath;
+  }
+
+  /** Build the file:// URL we hand to the browser. If the active file
+   *  is inside the blog folder, prefer its specific rendered path. */
+  private previewURL(previewDir: string): string {
+    const active = this.app.workspace.getActiveFile();
+    if (active && this.isInsideBlogFolder(active.path)) {
+      const rel = this.relPathInBlog(active.path);
+      // post/foo/bar.md → post/foo/bar/index.html
+      if (rel.startsWith("post/")) {
+        const stripped = rel.replace(/\.md$/, "");
+        const candidate = path.join(previewDir, stripped, "index.html");
+        if (fs.existsSync(candidate)) return "file://" + candidate;
+      }
+      if (rel.startsWith("pages/")) {
+        const name = path.basename(rel, ".md");
+        const candidate = path.join(previewDir, name, "index.html");
+        if (fs.existsSync(candidate)) return "file://" + candidate;
+      }
+    }
+    return "file://" + path.join(previewDir, "index.html");
+  }
+
+  private spawnGobog(bin: string, cfgPath: string, outputDir: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(bin, ["-config", cfgPath, "-export", outputDir], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stdout.on("data", (b) => console.log("[gobog]", b.toString().trimEnd()));
+      child.stderr.on("data", (b) => {
+        const s = b.toString();
+        stderr += s;
+        console.warn("[gobog]", s.trimEnd());
+      });
+      child.once("error", (err) => reject(new Error(`spawn ${bin}: ${err.message}`)));
+      child.once("close", (code) => {
+        if (code === 0) return resolve();
+        const tail = stderr.split("\n").filter(Boolean).slice(-3).join(" | ");
+        reject(new Error(`gobog exited with code ${code}: ${tail}`));
+      });
+    });
   }
 
   private requireRepoConfigured() {
@@ -423,6 +634,93 @@ function stripProtocol(url: string): string {
   // For now we hard-code: anything that looks like a github repo URL maps
   // to sbrave.cn. Users with a different domain can edit the source.
   return "sbrave.cn";
+}
+
+/**
+ * Modal that previews `git diff --cached` to the user before a commit
+ * and resolves the supplied callback with true (Commit & Push) or false
+ * (Cancel). The diff text is shown verbatim inside a <pre>; long diffs
+ * scroll vertically inside the modal so the bottom buttons stay reachable.
+ *
+ * The patch portion of `git diff --stat --patch` can be enormous; cap
+ * the displayed body at MAX_DIFF_CHARS so Obsidian doesn't hang trying
+ * to lay out a 1-million-character block. The user gets a "[truncated]"
+ * line and can always inspect the full diff via the standalone "Show
+ * sync status" command or their terminal.
+ */
+class DiffConfirmModal extends Modal {
+  private static readonly MAX_DIFF_CHARS = 200_000;
+  private diff: string;
+  private commitMsg: string;
+  private resolve: (ok: boolean) => void;
+  private resolved = false;
+
+  constructor(app: App, diff: string, commitMsg: string, resolve: (ok: boolean) => void) {
+    super(app);
+    this.diff = diff;
+    this.commitMsg = commitMsg;
+    this.resolve = resolve;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("gobog-diff-modal");
+
+    contentEl.createEl("h2", { text: "Review changes before pushing" });
+
+    contentEl.createEl("p", {
+      text: "Commit message:",
+      attr: { style: "margin: 8px 0 4px; color: var(--text-muted); font-size: 12px;" },
+    });
+    const msgEl = contentEl.createEl("pre", {
+      text: this.commitMsg,
+      attr: {
+        style:
+          "background: var(--background-secondary); padding: 8px 10px; border-radius: 4px; " +
+          "margin: 0 0 14px; font-size: 12px; white-space: pre-wrap; max-height: 80px; overflow: auto;",
+      },
+    });
+    void msgEl;
+
+    let body = this.diff;
+    if (body.length > DiffConfirmModal.MAX_DIFF_CHARS) {
+      body =
+        body.slice(0, DiffConfirmModal.MAX_DIFF_CHARS) +
+        `\n\n[…diff truncated — ${body.length - DiffConfirmModal.MAX_DIFF_CHARS} chars hidden. Run \`git diff --cached\` for the full view.]`;
+    }
+    contentEl.createEl("pre", {
+      text: body,
+      attr: {
+        style:
+          "background: var(--background-primary-alt); padding: 10px 12px; border-radius: 4px; " +
+          "font-family: var(--font-monospace); font-size: 12px; line-height: 1.45; " +
+          "max-height: 50vh; overflow: auto; white-space: pre; margin: 0;",
+      },
+    });
+
+    const buttonRow = contentEl.createDiv({ attr: { style: "margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end;" } });
+    const cancelBtn = buttonRow.createEl("button", { text: "Cancel" });
+    const okBtn = buttonRow.createEl("button", { text: "Commit & Push" });
+    okBtn.addClass("mod-cta");
+
+    cancelBtn.addEventListener("click", () => this.finish(false));
+    okBtn.addEventListener("click", () => this.finish(true));
+  }
+
+  onClose() {
+    // If the user dismissed by clicking outside / pressing Esc, treat
+    // it as a cancel. resolve only fires once thanks to the guard.
+    this.finish(false);
+    this.contentEl.empty();
+  }
+
+  private finish(ok: boolean) {
+    if (this.resolved) return;
+    this.resolved = true;
+    this.resolve(ok);
+    this.close();
+  }
 }
 
 class GobogSettingTab extends PluginSettingTab {
@@ -523,6 +821,20 @@ class GobogSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Sync behavior" });
 
     new Setting(containerEl)
+      .setName("Confirm diff before each push")
+      .setDesc(
+        "Show a modal with `git diff --cached` and require explicit " +
+          "confirmation before committing. Applies to manual and auto-push. " +
+          "Default on.",
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.confirmBeforePush).onChange(async (v) => {
+          this.plugin.settings.confirmBeforePush = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
       .setName("Pull on plugin start")
       .setDesc("Fetch + fast-forward when Obsidian opens this vault.")
       .addToggle((t) =>
@@ -599,6 +911,49 @@ class GobogSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.urlPattern)
           .onChange(async (v) => {
             this.plugin.settings.urlPattern = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    containerEl.createEl("h2", { text: "Local preview" });
+
+    const previewDesc = containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Run gobog locally to preview the rendered site in your browser " +
+        "before pushing. Both fields below are optional — leave them blank " +
+        "to disable the command.",
+    });
+    previewDesc.style.marginTop = "0";
+
+    new Setting(containerEl)
+      .setName("gobog binary path")
+      .setDesc(
+        "Absolute path to a built gobog executable. Build it in the gobog " +
+          "repo with `make build`. Required for the preview command.",
+      )
+      .addText((t) =>
+        t
+          .setPlaceholder("/usr/local/bin/gobog")
+          .setValue(this.plugin.settings.gobogBinPath)
+          .onChange(async (v) => {
+            this.plugin.settings.gobogBinPath = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Theme path")
+      .setDesc(
+        "Absolute path to a gobog theme directory. Defaults to " +
+          "<gobog-bin-dir>/themes/minimal when blank.",
+      )
+      .addText((t) =>
+        t
+          .setPlaceholder("/path/to/gobog/themes/minimal")
+          .setValue(this.plugin.settings.themePath)
+          .onChange(async (v) => {
+            this.plugin.settings.themePath = v;
             await this.plugin.saveSettings();
           }),
       );

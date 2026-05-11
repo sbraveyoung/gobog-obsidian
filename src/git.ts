@@ -119,22 +119,68 @@ export async function gitPull(
  * Stage everything dirty, commit, push. No-op when status is clean.
  * Tokenised remote URL is used inline in the push so it never lands in
  * `.git/config`.
+ *
+ * For interactive workflows where the user wants to confirm the change
+ * set first, use gitStageAndDiff + gitCommitAndPush instead.
  */
 export async function gitPushAll(dir: string, opts: PushOpts): Promise<void> {
-  // Author identity goes through git config (per-repo, not global).
-  await git(["config", "user.name", opts.authorName], dir);
-  await git(["config", "user.email", opts.authorEmail], dir);
+  const diff = await gitStageAndDiff(dir, opts.authorName, opts.authorEmail);
+  if (diff === null) return; // nothing staged
+  await gitCommitAndPush(dir, opts);
+}
 
+/**
+ * Stage everything dirty and return `git diff --cached` so the caller
+ * can show it to the user for confirmation. Returns `null` when the
+ * working tree was clean (nothing to do).
+ *
+ * The author config is set here (rather than in commit) because the
+ * commit-and-push path may run later via a separate call.
+ */
+export async function gitStageAndDiff(
+  dir: string,
+  authorName: string,
+  authorEmail: string,
+): Promise<string | null> {
+  await git(["config", "user.name", authorName], dir);
+  await git(["config", "user.email", authorEmail], dir);
   await git(["add", "-A"], dir);
+  const status = await gitOut(["status", "--porcelain"], dir);
+  if (status.trim() === "") return null;
+  return await gitOut(["diff", "--cached", "--stat", "--patch"], dir);
+}
 
-  // Bail when nothing's actually staged.
+/**
+ * Commit the currently-staged tree and push to origin/<branch>. The
+ * tokenised remote URL is used inline so it never lands in `.git/config`.
+ * Caller is responsible for calling gitStageAndDiff first.
+ */
+export async function gitCommitAndPush(
+  dir: string,
+  opts: PushOpts,
+): Promise<void> {
+  // Status check defends against a race where the diff was shown but the
+  // user took long enough that another process committed. Cheap.
   const status = await gitOut(["status", "--porcelain"], dir);
   if (status.trim() === "") return;
 
   await git(["commit", "-m", opts.commitMessage], dir);
-
   const remote = withToken(opts.remoteUrl, opts.token);
   await git(["push", remote, "HEAD:" + opts.branch], dir);
+}
+
+/** Unstage everything. Used when the user dismisses the diff modal —
+ *  the working tree stays untouched so the next save resumes normally. */
+export async function gitResetStaged(dir: string): Promise<void> {
+  if (!isGitRepo(dir)) return;
+  try {
+    // `git reset` with no commit argument resets the index to HEAD,
+    // leaving the working tree alone. On a brand-new repo (no HEAD yet)
+    // we fall back to `rm --cached -r .`.
+    await git(["reset"], dir);
+  } catch {
+    await git(["rm", "--cached", "-r", "."], dir).catch(() => undefined);
+  }
 }
 
 /** `git status --porcelain` reduced to a count + sample paths. */

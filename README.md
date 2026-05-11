@@ -95,9 +95,26 @@ Command palette:
 - **Gobog Sync: Show sync status** — quick "clean / N changed files" notice.
 - **Gobog Sync: Fill front matter for the active file** — re-runs the
   auto-fill on demand (useful for files that pre-date the plugin).
+- **Gobog Sync: Preview blog locally** — runs the configured gobog
+  binary against the blog folder and opens the rendered output in your
+  default browser. If a post is open it opens that specific URL.
+  Requires `gobog binary path` in settings.
 - **Gobog Sync: Push active post to WeChat (公众号) as draft** —
   submits the current note to the WeChat MP draft box. Only visible
   when WeChat integration is enabled in settings.
+
+## Diff confirmation
+
+By default every push (manual or auto) opens a modal showing
+`git diff --cached` and the proposed commit message. **Commit & Push**
+proceeds; **Cancel** un-stages everything and aborts (your working
+tree is left alone, so a subsequent save resumes normally). Long
+diffs scroll inside the modal; very large diffs are truncated with a
+pointer to `git diff --cached` so Obsidian doesn't hang trying to lay
+out hundreds of thousands of characters.
+
+If you'd rather push silently, turn off
+**Settings → Gobog Sync → Confirm diff before each push**.
 
 ## WeChat 公众号 (optional)
 

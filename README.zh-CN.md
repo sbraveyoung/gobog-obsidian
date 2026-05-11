@@ -91,9 +91,23 @@ npm run build
 - **Gobog Sync: Show sync status** — 提示"干净 / 有 N 个文件改动"。
 - **Gobog Sync: Fill front matter for the active file** — 手动重跑一次
   自动填充（适合给"插件装好之前就存在"的旧文件补字段）。
+- **Gobog Sync: Preview blog locally** — 调用本地 gobog 二进制把
+  blog 文件夹渲染一遍，然后在默认浏览器里打开结果。当前如果开着一篇
+  文章，会直接跳到那一篇的预览页面。需要在设置里配置 `gobog binary path`。
 - **Gobog Sync: Push active post to WeChat (公众号) as draft** —
   把当前文章作为草稿推送到微信公众号。只有在设置里启用 WeChat 推送
   后才会出现。
+
+## 提交前的 Diff 确认
+
+默认每次 push（手动 / 自动都包括）都会先弹一个 modal 显示
+`git diff --cached` 和将要使用的 commit 信息。**Commit & Push** 继续，
+**Cancel** 把暂存区清空、本次 push 中止（工作目录不动，下次保存照常
+继续）。大 diff 在 modal 里滚动；过大的 diff 会截断并提示用
+`git diff --cached` 看完整版本，避免 Obsidian 卡顿。
+
+不想每次都确认的话，去
+**设置 → Gobog Sync → Confirm diff before each push** 关掉。
 
 ## 微信公众号推送（可选）
 
