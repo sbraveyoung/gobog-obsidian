@@ -1,5 +1,7 @@
 # Gobog Sync
 
+**[English](./README.md)** | [简体中文](./README.zh-CN.md)
+
 Obsidian plugin: keeps a folder of your vault in sync with a GitHub markdown
 repo, two-way, and auto-fills front matter on new notes.
 
