@@ -29,6 +29,12 @@ Obsidian vault              GitHub 仓库                 GitHub Pages
   插件会自动把 `title`、`author`、`id`、`url`、`create_time`、
   `updated_time` 几个字段补齐。**永远不会覆盖你已经写好的字段**——
   只补缺失的。
+- **推送到微信公众号草稿（可选）**：把当前笔记作为**草稿**推到
+  公众号后台。插件**永远不会自动发布**——你需要登录
+  mp.weixin.qq.com 在草稿箱里预览、确认、点发布。插件会自动把
+  文章里的本地图片上传成永久素材、把图片 URL 替换成微信 CDN 链接、
+  内联 CSS（公众号会剥掉 `<style>` 块），然后调用
+  `/cgi-bin/draft/add` 创建草稿。默认关闭，需要时在设置里启用。
 
 插件**不做**的事：
 
@@ -85,6 +91,36 @@ npm run build
 - **Gobog Sync: Show sync status** — 提示"干净 / 有 N 个文件改动"。
 - **Gobog Sync: Fill front matter for the active file** — 手动重跑一次
   自动填充（适合给"插件装好之前就存在"的旧文件补字段）。
+- **Gobog Sync: Push active post to WeChat (公众号) as draft** —
+  把当前文章作为草稿推送到微信公众号。只有在设置里启用 WeChat 推送
+  后才会出现。
+
+## 微信公众号推送（可选）
+
+设置 → Gobog Sync → WeChat 公众号 (草稿)。
+
+| 字段                          | 说明 |
+| ----------------------------- | --- |
+| 启用 WeChat 推送              | 打开后命令面板里会多出推送命令。 |
+| AppID / AppSecret             | 公众号后台 → 开发 → 基本配置。本地存储。 |
+| 默认作者                      | WeChat 文章页显示的作者；留空则用 front-matter 里的 `author:`。 |
+| 默认封面 `thumb_media_id`     | 可选；不填时插件自动用文章里第一张本地图片作为封面，没有图片会报错。 |
+
+工作流程：
+
+1. 插件读取当前笔记；
+2. 扫描 markdown 里的图片引用（`![alt](./resource/image/foo.png)` 和
+   `![[foo.png]]` 两种语法都识别），把每张本地图片上传到微信永久
+   素材，并把 markdown 里的 URL 替换成微信返回的 CDN 链接；
+3. 把改写后的 markdown 用 `marked` 渲染成 HTML，然后把少量样式
+   inline 进去（公众号会剥掉 `<style>` 块）；
+4. 调用 `/cgi-bin/draft/add` 创建草稿，返回 `media_id`；
+5. 你在 <https://mp.weixin.qq.com/> 草稿箱里**人工**预览、确认、
+   点发布。**插件永远不会自己发布**——这是 "人工审核" 的保障。
+
+公众号端需要事先做的：开通"服务号 / 订阅号 + API 权限"，并在
+**IP 白名单**里加上本机出口 IP。插件用的是 `/cgi-bin/stable_token`，
+所以 IP 白名单 OK 之后 access_token 刷新交给内存缓存就好。
 
 ## Front matter 契约
 

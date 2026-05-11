@@ -13,6 +13,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { gitPull, gitPushAll, gitInitIfMissing, gitStatusSummary } from "./git";
 import { ensureFrontMatter, generateId, FrontMatterDefaults } from "./frontmatter";
+import { pushToWeChat, resetTokenCache } from "./wechat";
 
 export interface GobogObsidianSettings {
   /** Path inside the vault (relative) that mirrors the blog repo. */
@@ -44,6 +45,16 @@ export interface GobogObsidianSettings {
 
   /** Commit message template. Supports {{date}}, {{count}}, {{paths}}. */
   commitTemplate: string;
+
+  // ---- WeChat 公众号 (optional) ----
+  wechatEnabled: boolean;
+  wechatAppId: string;
+  wechatAppSecret: string;
+  /** Default author shown on the WeChat article. Falls back to defaultAuthor. */
+  wechatAuthor: string;
+  /** Optional fixed cover thumb_media_id (the media you uploaded once via
+   *  the WeChat backend or our own first-image-fallback). */
+  wechatDefaultThumbMediaId: string;
 }
 
 const DEFAULTS: GobogObsidianSettings = {
@@ -64,6 +75,12 @@ const DEFAULTS: GobogObsidianSettings = {
   autoFrontMatter: true,
 
   commitTemplate: "obsidian sync: {{count}} file(s) at {{date}}",
+
+  wechatEnabled: false,
+  wechatAppId: "",
+  wechatAppSecret: "",
+  wechatAuthor: "",
+  wechatDefaultThumbMediaId: "",
 };
 
 export default class GobogObsidianPlugin extends Plugin {
@@ -102,6 +119,23 @@ export default class GobogObsidianPlugin extends Plugin {
         const ok = !!(f && this.isInsideBlogFolder(f.path));
         if (!ok) return false;
         if (!checking) this.fillFrontMatterForFile(f!).catch((e) => this.fail(e));
+        return true;
+      },
+    });
+
+    // WeChat draft push — only enabled when wechatEnabled is true. The
+    // command itself stays registered either way so the user discovers
+    // it in the palette; but the checkCallback gates it on a configured
+    // post being open + the integration being on.
+    this.addCommand({
+      id: "wechat-push-draft",
+      name: "Push active post to WeChat (公众号) as draft",
+      checkCallback: (checking) => {
+        const f = this.app.workspace.getActiveFile();
+        const inBlog = !!(f && this.isInsideBlogFolder(f.path));
+        const eligible = inBlog && this.settings.wechatEnabled;
+        if (!eligible) return false;
+        if (!checking) this.runWeChatPush(f!).catch((e) => this.fail(e));
         return true;
       },
     });
@@ -264,6 +298,50 @@ export default class GobogObsidianPlugin extends Plugin {
     this.setStatus(text);
   }
 
+  /**
+   * Submit the active note to the WeChat 公众号 draft box. The draft
+   * is *not* auto-published — the user reviews and publishes from the
+   * WeChat MP backend (https://mp.weixin.qq.com/). This satisfies the
+   * "manual review" requirement.
+   */
+  async runWeChatPush(file: TFile) {
+    if (!this.settings.wechatEnabled) {
+      throw new Error("WeChat integration is off — enable it in Settings → Gobog Sync → WeChat.");
+    }
+    if (!this.settings.wechatAppId.trim() || !this.settings.wechatAppSecret.trim()) {
+      throw new Error("WeChat AppID / AppSecret missing — fill them in Settings.");
+    }
+
+    this.setStatus("gobog: wechat draft submitting…");
+    const abs = path.join(this.blogFolderAbs(), this.relPathInBlog(file.path));
+    const md = fs.readFileSync(abs, "utf8");
+
+    // Pull title / author from front matter when present; fall back to
+    // the file basename and the configured default.
+    const meta = parseSimpleFrontMatter(md);
+    const title = meta.title || path.basename(file.path, ".md");
+    const author = (this.settings.wechatAuthor || meta.author || this.settings.defaultAuthor || "").trim();
+    const canonicalUrl = meta.url ? `https://${stripProtocol(this.settings.repoUrl)}${meta.url}` : "";
+
+    const result = await pushToWeChat(
+      { title, author, markdown: md, canonicalUrl },
+      {
+        appId: this.settings.wechatAppId.trim(),
+        appSecret: this.settings.wechatAppSecret.trim(),
+        author,
+        defaultThumbMediaId: this.settings.wechatDefaultThumbMediaId.trim(),
+        vaultBase: this.blogFolderAbs(),
+      },
+    );
+
+    new Notice(
+      `gobog: WeChat draft created (media_id ${result.mediaId.slice(0, 8)}…). ` +
+        `Open https://mp.weixin.qq.com/ → 草稿箱 to review and publish.`,
+      14000,
+    );
+    this.setStatus("gobog: wechat draft submitted");
+  }
+
   private requireRepoConfigured() {
     if (!this.settings.repoUrl.trim()) {
       throw new Error("Set the Repository URL in Settings → Gobog Sync.");
@@ -322,6 +400,29 @@ function renderCommitMessage(
     .replace(/\{\{date\}\}/g, iso)
     .replace(/\{\{count\}\}/g, String(summary.changedCount))
     .replace(/\{\{paths\}\}/g, summary.changedPaths.slice(0, 4).join(", "));
+}
+
+/** Lightweight `--- ... ---` front-matter reader. We only need a few keys
+ *  (title, author, url) for the WeChat path. Anything more elaborate is
+ *  left to the gobog scanner. */
+function parseSimpleFrontMatter(md: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!md.startsWith("---")) return out;
+  const end = md.indexOf("\n---", 3);
+  if (end < 0) return out;
+  for (const line of md.slice(3, end).split("\n")) {
+    const m = /^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/.exec(line);
+    if (m) out[m[1].toLowerCase()] = m[2];
+  }
+  return out;
+}
+
+/** "https://github.com/sbraveyoung/blog.git" → "sbrave.cn". Used so the
+ *  WeChat "原文链接" points back at the blog domain rather than github.com. */
+function stripProtocol(url: string): string {
+  // For now we hard-code: anything that looks like a github repo URL maps
+  // to sbrave.cn. Users with a different domain can edit the source.
+  return "sbrave.cn";
 }
 
 class GobogSettingTab extends PluginSettingTab {
@@ -498,6 +599,79 @@ class GobogSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.urlPattern)
           .onChange(async (v) => {
             this.plugin.settings.urlPattern = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    containerEl.createEl("h2", { text: "WeChat 公众号 (草稿)" });
+
+    const wechatDesc = containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "把文章作为草稿推送到微信公众号——内容不会自动发布，需要登录 " +
+        "mp.weixin.qq.com 在草稿箱里人工审核、预览后再点发布。需要先在 " +
+        "公众号后台把本机出口 IP 加到 IP 白名单。",
+    });
+    wechatDesc.style.marginTop = "0";
+
+    new Setting(containerEl)
+      .setName("启用 WeChat 推送")
+      .setDesc("命令面板里会多出 \"Push active post to WeChat (公众号) as draft\"。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.wechatEnabled).onChange(async (v) => {
+          this.plugin.settings.wechatEnabled = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("AppID")
+      .setDesc("公众号后台 → 开发 → 基本配置 里的 AppID。")
+      .addText((t) =>
+        t
+          .setPlaceholder("wx...")
+          .setValue(this.plugin.settings.wechatAppId)
+          .onChange(async (v) => {
+            this.plugin.settings.wechatAppId = v;
+            await this.plugin.saveSettings();
+            resetTokenCache();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("AppSecret")
+      .setDesc("和 AppID 在同一个页面。本地保存，跟 GitHub token 一样。")
+      .addText((t) => {
+        t.inputEl.type = "password";
+        t.setPlaceholder("***")
+          .setValue(this.plugin.settings.wechatAppSecret)
+          .onChange(async (v) => {
+            this.plugin.settings.wechatAppSecret = v;
+            await this.plugin.saveSettings();
+            resetTokenCache();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("默认作者")
+      .setDesc("WeChat 文章页显示的作者。留空则用文章 front matter 里的 author，再不行用上面的 \"Default author\"。")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.wechatAuthor)
+          .onChange(async (v) => {
+            this.plugin.settings.wechatAuthor = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("默认封面 thumb_media_id")
+      .setDesc("可选。留空时插件会自动用文章里第一张本地图片作为封面；没有图片会报错。")
+      .addText((t) =>
+        t
+          .setValue(this.plugin.settings.wechatDefaultThumbMediaId)
+          .onChange(async (v) => {
+            this.plugin.settings.wechatDefaultThumbMediaId = v;
             await this.plugin.saveSettings();
           }),
       );

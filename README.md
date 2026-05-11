@@ -31,6 +31,13 @@ What this plugin does:
   folder, the plugin prepends a YAML block with `title`, `author`, `id`,
   `url`, `create_time`, `updated_time`. Existing front-matter is never
   overwritten — only the missing keys are added.
+- **Push to WeChat 公众号 (optional)**: submits the active note as a
+  *draft* to the WeChat MP draft box. Drafts are never auto-published —
+  you log into mp.weixin.qq.com, preview, and click 发布. The plugin
+  uploads embedded images as permanent material, rewrites their URLs in
+  the article, inlines CSS so WeChat's HTML sanitizer keeps the styling,
+  and creates the draft via `/cgi-bin/draft/add`. Off by default —
+  enable in settings if you want it.
 
 What this plugin doesn't do:
 
@@ -88,6 +95,39 @@ Command palette:
 - **Gobog Sync: Show sync status** — quick "clean / N changed files" notice.
 - **Gobog Sync: Fill front matter for the active file** — re-runs the
   auto-fill on demand (useful for files that pre-date the plugin).
+- **Gobog Sync: Push active post to WeChat (公众号) as draft** —
+  submits the current note to the WeChat MP draft box. Only visible
+  when WeChat integration is enabled in settings.
+
+## WeChat 公众号 (optional)
+
+Settings → Gobog Sync → WeChat 公众号 (草稿).
+
+| Field                       | Notes |
+| --------------------------- | --- |
+| 启用 WeChat 推送            | Turns the integration on and reveals the command. |
+| AppID / AppSecret           | From 公众号后台 → 开发 → 基本配置. Stored locally. |
+| 默认作者                    | Shown on the WeChat article. Falls back to front-matter `author:`. |
+| 默认封面 `thumb_media_id`   | Optional. When blank, the first uploaded image becomes the cover. If the article has no local image, the push fails with a clear error. |
+
+How it works:
+
+1. Plugin reads the active note.
+2. Walks the markdown for image refs (both `![alt](./resource/image/foo.png)`
+   and `![[foo.png]]`), uploads each one to WeChat permanent material,
+   rewrites the markdown to use the returned CDN URL.
+3. Converts the rewritten markdown to HTML via `marked`, then inlines a
+   small set of styles (`<style>` blocks get stripped by WeChat).
+4. Posts to `/cgi-bin/draft/add`, returns a `media_id`.
+5. You open <https://mp.weixin.qq.com/> → 草稿箱, preview, edit (if
+   needed), and click 发布. The plugin **never** publishes by itself —
+   that's the "human review" guarantee.
+
+Required setup on the WeChat side: the public account must be a
+**service account / 服务号 / 订阅号 with API permissions**, and your
+home IP must be added to the **IP 白名单**. The plugin uses
+`/cgi-bin/stable_token` so once your IP is whitelisted, the cache
+handles refresh transparently.
 
 ## Front matter contract
 
