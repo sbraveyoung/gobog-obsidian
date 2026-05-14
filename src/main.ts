@@ -24,6 +24,7 @@ import {
 } from "./git";
 import { ensureFrontMatter, generateId, FrontMatterDefaults } from "./frontmatter";
 import { pushToWeChat, resetTokenCache } from "./wechat";
+import { getLatestDeploy, summarizeDeploy, DeployStatusResult } from "./deploy-status";
 
 export interface GobogObsidianSettings {
   /** Path inside the vault (relative) that mirrors the blog repo. */
@@ -77,6 +78,18 @@ export interface GobogObsidianSettings {
   /** Optional fixed cover thumb_media_id (the media you uploaded once via
    *  the WeChat backend or our own first-image-fallback). */
   wechatDefaultThumbMediaId: string;
+
+  // ---- Deploy status echo (optional, polls GitHub Actions) ----
+  /** When true, after every successful push we ping the github.io
+   *  Actions API and surface the latest workflow run in the status bar. */
+  deployStatusEnabled: boolean;
+  /** owner/repo of the github.io repo whose workflow we watch. */
+  deployStatusRepo: string;
+  /** Workflow filename inside .github/workflows/. */
+  deployStatusWorkflow: string;
+  /** How long to wait after a push before the first status poll (seconds).
+   *  Workflow needs a moment to spin up — 30s is usually enough. */
+  deployStatusPollDelaySec: number;
 }
 
 const DEFAULTS: GobogObsidianSettings = {
@@ -108,6 +121,11 @@ const DEFAULTS: GobogObsidianSettings = {
   wechatAppSecret: "",
   wechatAuthor: "",
   wechatDefaultThumbMediaId: "",
+
+  deployStatusEnabled: false,
+  deployStatusRepo: "sbraveyoung/sbraveyoung.github.io",
+  deployStatusWorkflow: "deploy.yml",
+  deployStatusPollDelaySec: 30,
 };
 
 export default class GobogObsidianPlugin extends Plugin {
@@ -175,6 +193,16 @@ export default class GobogObsidianPlugin extends Plugin {
         if (!checking) this.runWeChatPush(f!).catch((e) => this.fail(e));
         return true;
       },
+    });
+
+    // Always registered so it shows in the palette, but only does
+    // useful work when deployStatusEnabled is on. The handler itself
+    // explains the off case via a notice rather than silently
+    // succeeding — saves a settings-spelunking round-trip.
+    this.addCommand({
+      id: "deploy-status-check",
+      name: "Check latest deploy status (github.io workflow)",
+      callback: () => this.runDeployStatusCheck().catch((e) => this.fail(e)),
     });
 
     this.addSettingTab(new GobogSettingTab(this.app, this));
@@ -347,6 +375,14 @@ export default class GobogObsidianPlugin extends Plugin {
     });
     new Notice(`gobog: pushed ${summary.changedCount} file(s)`);
     this.setStatus("gobog: idle");
+
+    // Optional: after a successful push, give the github.io deploy
+    // workflow ~30s head-start and then echo its run status in the
+    // status bar. Closes the "did the push actually publish?" loop
+    // without leaving Obsidian.
+    if (this.settings.deployStatusEnabled) {
+      this.scheduleDeployStatusCheck();
+    }
   }
 
   /** Show the diff in a modal and resolve true on confirm, false on cancel. */
@@ -411,6 +447,60 @@ export default class GobogObsidianPlugin extends Plugin {
       14000,
     );
     this.setStatus("gobog: wechat draft submitted");
+  }
+
+  /**
+   * Read the latest run of the github.io deploy workflow from the
+   * GitHub Actions API and surface it in the status bar + a notice.
+   *
+   * Public repos work unauthenticated; we still send the configured
+   * token when present because (a) it raises the rate limit from 60
+   * to 5000/h and (b) it lets the same code work if the user ever
+   * makes the github.io repo private.
+   */
+  async runDeployStatusCheck() {
+    if (!this.settings.deployStatusEnabled) {
+      new Notice("gobog: deploy status echo is off — turn on in Settings → Deploy status.");
+      return;
+    }
+    const repo = this.settings.deployStatusRepo.trim();
+    if (!repo) {
+      throw new Error("Deploy status repo is empty — set it in Settings (e.g. sbraveyoung/sbraveyoung.github.io).");
+    }
+    this.setStatus("gobog: checking deploy…");
+    const result = await getLatestDeploy({
+      repo,
+      workflow: this.settings.deployStatusWorkflow.trim() || "deploy.yml",
+      token: this.settings.githubToken,
+    });
+    if (!result) {
+      this.setStatus("gobog: no deploy runs found");
+      new Notice(`gobog: no runs found for ${repo} / ${this.settings.deployStatusWorkflow}`);
+      return;
+    }
+    const summary = summarizeDeploy(result);
+    this.setStatus(`gobog: ${summary}`);
+    const noticeBody =
+      `gobog: ${summary}\n` +
+      (result.headCommitMsg ? result.headCommitMsg + "\n" : "") +
+      result.htmlUrl;
+    new Notice(noticeBody, 14000);
+  }
+
+  /**
+   * Queue a single deploy-status check `deployStatusPollDelaySec`
+   * seconds in the future. Idempotent — overlapping calls debounce
+   * to one timer.
+   */
+  private deployStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  private scheduleDeployStatusCheck() {
+    if (this.deployStatusTimer) clearTimeout(this.deployStatusTimer);
+    const delayMs = Math.max(5, this.settings.deployStatusPollDelaySec) * 1000;
+    this.setStatus(`gobog: deploy check in ${Math.round(delayMs / 1000)}s`);
+    this.deployStatusTimer = setTimeout(() => {
+      this.deployStatusTimer = null;
+      this.runDeployStatusCheck().catch((e) => this.fail(e));
+    }, delayMs);
   }
 
   /**
@@ -1028,6 +1118,69 @@ class GobogSettingTab extends PluginSettingTab {
           .onChange(async (v) => {
             this.plugin.settings.wechatDefaultThumbMediaId = v;
             await this.plugin.saveSettings();
+          }),
+      );
+
+    containerEl.createEl("h2", { text: "Deploy status echo" });
+
+    const deployDesc = containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Push 完成后，自动去 GitHub Actions 拉一次 github.io 的 deploy " +
+        "workflow 状态贴在状态栏（deploy ✓ / … / ✗），把 push → 渲染 → " +
+        "发布的闭环收尾。命令面板里也有 \"Check latest deploy status\" " +
+        "可以随时手动查。",
+    });
+    deployDesc.style.marginTop = "0";
+
+    new Setting(containerEl)
+      .setName("启用部署状态回显")
+      .setDesc("每次成功 push 后延迟若干秒去拉 workflow run 状态。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.deployStatusEnabled).onChange(async (v) => {
+          this.plugin.settings.deployStatusEnabled = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("github.io 仓库")
+      .setDesc("owner/repo 形式。默认是 sbraveyoung/sbraveyoung.github.io。")
+      .addText((t) =>
+        t
+          .setPlaceholder("sbraveyoung/sbraveyoung.github.io")
+          .setValue(this.plugin.settings.deployStatusRepo)
+          .onChange(async (v) => {
+            this.plugin.settings.deployStatusRepo = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Workflow 文件名")
+      .setDesc(".github/workflows/ 下的文件名，默认 deploy.yml。")
+      .addText((t) =>
+        t
+          .setPlaceholder("deploy.yml")
+          .setValue(this.plugin.settings.deployStatusWorkflow)
+          .onChange(async (v) => {
+            this.plugin.settings.deployStatusWorkflow = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("首次轮询延迟（秒）")
+      .setDesc("Push 之后等多久去查第一次状态。Action 启动要几秒到几十秒不等，30s 一般够。")
+      .addText((t) =>
+        t
+          .setValue(String(this.plugin.settings.deployStatusPollDelaySec))
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            if (!isNaN(n) && n > 0) {
+              this.plugin.settings.deployStatusPollDelaySec = n;
+              await this.plugin.saveSettings();
+            }
           }),
       );
   }
