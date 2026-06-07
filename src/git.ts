@@ -32,36 +32,72 @@ function isGitRepo(dir: string): boolean {
 }
 
 /**
- * Remove a `.git/index.lock` left behind by a previous git process that
+ * Remove `.lock` files left behind by a previous git process that
  * crashed or was killed mid-write (Obsidian force-quit, network drop
- * during push, etc.). Anything older than `maxAgeMs` (default 30s) is
- * treated as stale — a real git operation finishes in well under a
- * second, so a 30-second-old lock can't belong to a live process. Fresh
- * locks are left alone in case the user actually has a concurrent git
- * running in a terminal.
+ * during push, signal kill). Covers:
  *
- * Idempotent: no-op when the lock is absent or fresh. Logs to the dev
- * console when it actually removes something so the user has a trail
- * if they're investigating.
+ *   - `.git/index.lock`           — taken by add / commit / checkout
+ *   - `.git/HEAD.lock`            — HEAD update
+ *   - `.git/config.lock`          — config edits
+ *   - `.git/packed-refs.lock`     — ref packing
+ *   - `.git/shallow.lock`         — fetch with --depth=N (we use this)
+ *   - `.git/FETCH_HEAD.lock`      — fetch
+ *   - `.git/refs/**\/*.lock`      — per-ref locks (e.g. refs/heads/master.lock)
+ *
+ * Anything older than `maxAgeMs` (default 30s) is treated as stale —
+ * a real git operation finishes in well under a second, so a lock
+ * sitting around for half a minute can't belong to a live process.
+ * Fresh locks are left alone in case the user actually has a
+ * concurrent git running in a terminal.
+ *
+ * Idempotent: no-op when nothing stale is present. Per-file failures
+ * (EBUSY / permission) are logged but not raised — we let the
+ * subsequent git command surface its own real error message rather
+ * than masking it here.
  */
-function clearStaleIndexLock(dir: string, maxAgeMs = 30_000): void {
-  const lock = path.join(dir, ".git", "index.lock");
-  let age: number;
+function clearStaleGitLocks(dir: string, maxAgeMs = 30_000): void {
+  const gitDir = path.join(dir, ".git");
+  const candidates: string[] = [];
+
+  // Top-level .git/*.lock
   try {
-    age = Date.now() - fs.statSync(lock).mtimeMs;
+    for (const name of fs.readdirSync(gitDir)) {
+      if (name.endsWith(".lock")) candidates.push(path.join(gitDir, name));
+    }
   } catch {
-    return; // no lock present, nothing to do
+    return; // no .git dir — nothing to do
   }
-  if (age <= maxAgeMs) return; // looks live — leave it
+
+  // .git/refs/**\/*.lock — walk recursively. Typical repo has a
+  // handful of refs so this is cheap.
+  walkLocks(path.join(gitDir, "refs"), candidates);
+
+  const now = Date.now();
+  for (const lock of candidates) {
+    try {
+      const age = now - fs.statSync(lock).mtimeMs;
+      if (age <= maxAgeMs) continue; // looks live, leave it
+      fs.unlinkSync(lock);
+      console.warn(
+        `[gobog-sync] removed stale ${path.relative(dir, lock)} (${Math.round(age / 1000)}s old)`,
+      );
+    } catch (e) {
+      console.warn(`[gobog-sync] failed to clear ${lock}: ${e}`);
+    }
+  }
+}
+
+function walkLocks(dir: string, out: string[]): void {
+  let entries: fs.Dirent[];
   try {
-    fs.unlinkSync(lock);
-    console.warn(
-      `[gobog-sync] removed stale .git/index.lock (${Math.round(age / 1000)}s old) in ${dir}`,
-    );
-  } catch (e) {
-    // EBUSY / permission issue — let the subsequent git command surface
-    // the real error message; better than masking it here.
-    console.warn(`[gobog-sync] failed to remove stale index.lock: ${e}`);
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return; // dir missing (no refs/ yet on a fresh init), skip
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walkLocks(full, out);
+    else if (entry.name.endsWith(".lock")) out.push(full);
   }
 }
 
@@ -106,7 +142,7 @@ export async function gitPull(
   remoteUrl: string,
   token: string,
 ): Promise<void> {
-  clearStaleIndexLock(dir);
+  clearStaleGitLocks(dir);
   const remote = withToken(remoteUrl, token);
 
   // Fetch the branch from the tokenised URL but never persist the token.
@@ -177,7 +213,7 @@ export async function gitStageAndDiff(
   authorName: string,
   authorEmail: string,
 ): Promise<string | null> {
-  clearStaleIndexLock(dir);
+  clearStaleGitLocks(dir);
   await git(["config", "user.name", authorName], dir);
   await git(["config", "user.email", authorEmail], dir);
   await git(["add", "-A"], dir);
@@ -195,7 +231,7 @@ export async function gitCommitAndPush(
   dir: string,
   opts: PushOpts,
 ): Promise<void> {
-  clearStaleIndexLock(dir);
+  clearStaleGitLocks(dir);
   // Status check defends against a race where the diff was shown but the
   // user took long enough that another process committed. Cheap.
   const status = await gitOut(["status", "--porcelain"], dir);
@@ -210,7 +246,7 @@ export async function gitCommitAndPush(
  *  the working tree stays untouched so the next save resumes normally. */
 export async function gitResetStaged(dir: string): Promise<void> {
   if (!isGitRepo(dir)) return;
-  clearStaleIndexLock(dir);
+  clearStaleGitLocks(dir);
   try {
     // `git reset` with no commit argument resets the index to HEAD,
     // leaving the working tree alone. On a brand-new repo (no HEAD yet)
