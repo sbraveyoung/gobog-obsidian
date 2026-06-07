@@ -32,6 +32,40 @@ function isGitRepo(dir: string): boolean {
 }
 
 /**
+ * Remove a `.git/index.lock` left behind by a previous git process that
+ * crashed or was killed mid-write (Obsidian force-quit, network drop
+ * during push, etc.). Anything older than `maxAgeMs` (default 30s) is
+ * treated as stale — a real git operation finishes in well under a
+ * second, so a 30-second-old lock can't belong to a live process. Fresh
+ * locks are left alone in case the user actually has a concurrent git
+ * running in a terminal.
+ *
+ * Idempotent: no-op when the lock is absent or fresh. Logs to the dev
+ * console when it actually removes something so the user has a trail
+ * if they're investigating.
+ */
+function clearStaleIndexLock(dir: string, maxAgeMs = 30_000): void {
+  const lock = path.join(dir, ".git", "index.lock");
+  let age: number;
+  try {
+    age = Date.now() - fs.statSync(lock).mtimeMs;
+  } catch {
+    return; // no lock present, nothing to do
+  }
+  if (age <= maxAgeMs) return; // looks live — leave it
+  try {
+    fs.unlinkSync(lock);
+    console.warn(
+      `[gobog-sync] removed stale .git/index.lock (${Math.round(age / 1000)}s old) in ${dir}`,
+    );
+  } catch (e) {
+    // EBUSY / permission issue — let the subsequent git command surface
+    // the real error message; better than masking it here.
+    console.warn(`[gobog-sync] failed to remove stale index.lock: ${e}`);
+  }
+}
+
+/**
  * Make sure `dir` is a git repo wired to the configured remote and on the
  * configured branch. If `dir` already has a `.git`, only the remote URL
  * (and optionally the current branch) is reconciled. If not, we
@@ -72,6 +106,7 @@ export async function gitPull(
   remoteUrl: string,
   token: string,
 ): Promise<void> {
+  clearStaleIndexLock(dir);
   const remote = withToken(remoteUrl, token);
 
   // Fetch the branch from the tokenised URL but never persist the token.
@@ -142,6 +177,7 @@ export async function gitStageAndDiff(
   authorName: string,
   authorEmail: string,
 ): Promise<string | null> {
+  clearStaleIndexLock(dir);
   await git(["config", "user.name", authorName], dir);
   await git(["config", "user.email", authorEmail], dir);
   await git(["add", "-A"], dir);
@@ -159,6 +195,7 @@ export async function gitCommitAndPush(
   dir: string,
   opts: PushOpts,
 ): Promise<void> {
+  clearStaleIndexLock(dir);
   // Status check defends against a race where the diff was shown but the
   // user took long enough that another process committed. Cheap.
   const status = await gitOut(["status", "--porcelain"], dir);
@@ -173,6 +210,7 @@ export async function gitCommitAndPush(
  *  the working tree stays untouched so the next save resumes normally. */
 export async function gitResetStaged(dir: string): Promise<void> {
   if (!isGitRepo(dir)) return;
+  clearStaleIndexLock(dir);
   try {
     // `git reset` with no commit argument resets the index to HEAD,
     // leaving the working tree alone. On a brand-new repo (no HEAD yet)
