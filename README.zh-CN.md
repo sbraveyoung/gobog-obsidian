@@ -177,3 +177,9 @@ MIT
 - 部署状态会等待此次推送后的工作流，持续检查直到结束；公开站点 API 可退回匿名读取。
 
 验证：`npm ci`、`npm test`、`npm run build`。`main.js` 是生成物，改 `src/` 后构建。
+
+## Folder visibility (0.4)
+
+Open a note in the folder and use **Hide active note’s folder (including subfolders)** or **Show active note’s folder (parent hiding still applies)**. Commands edit `_folder.md` with a `hidden` Boolean; parent hiding vetoes child publication, and article draft/publish/private flags still apply. These control notes never receive article front matter. Requires a gobog version supporting folder policies on both the local binary and the deployed renderer pin.
+
+New articles receive explicit draft/publication switches and YAML-list tags. Existing publication intent and custom metadata stay intact when filling missing properties. See the renderer’s [publishing guide](https://github.com/sbraveyoung/gobog/blob/master/docs/publishing-pipeline.zh-CN.md).

@@ -182,3 +182,9 @@ MIT
 New posts default to `draft: true`; set `draft: false` when ready. Source sync includes drafts, so keep the source repository private. The renderer honors `publish: false` as well. Existing notes retain their state. Preview renders a temporary source copy, serves over loopback HTTP, and opens the permanent front-matter URL. Push retries pending commits even on a clean working tree, serializes sync operations, and leaves Git locks alone. External Git metadata via a `.git` pointer is supported for iCloud vaults. Deploy polling ignores runs older than the current push and falls back to anonymous reads for public sites.
 
 Run `npm ci`, `npm test`, and `npm run build`. Edit `src/`, then regenerate `main.js`.
+
+## Folder visibility (0.4)
+
+Open a note in the folder and use **Hide active note’s folder (including subfolders)** or **Show active note’s folder (parent hiding still applies)**. Commands edit `_folder.md` with a `hidden` Boolean; parent hiding vetoes child publication, and article draft/publish/private flags still apply. These control notes never receive article front matter. Requires a gobog version supporting folder policies on both the local binary and the deployed renderer pin.
+
+New articles receive explicit draft/publication switches and YAML-list tags. Existing publication intent and custom metadata stay intact when filling missing properties. See the renderer’s [publishing guide](https://github.com/sbraveyoung/gobog/blob/master/docs/publishing-pipeline.zh-CN.md).

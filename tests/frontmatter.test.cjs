@@ -11,3 +11,14 @@ test('explicit publication and existing custom metadata remain intact',()=>{
  const result=ensureFrontMatter(original,defaults);
  assert.ok(result.includes('publish: true'));assert.ok(result.includes('custom: value'));assert.ok(!result.includes('draft: true'));
 });
+test('false hidden/private defaults do not make a new template public',()=>{
+ const result=ensureFrontMatter('---\nhidden: false\nprivate: false\n---\nbody',defaults);
+ assert.ok(result.includes('draft: true'));
+});
+test('unclosed YAML is rejected without adding a second header',()=>{
+ assert.throws(()=>ensureFrontMatter('---\ntitle: unfinished\nbody',defaults),/closing/);
+});
+test('quoted YAML property names do not create duplicate ids',()=>{
+ const result=ensureFrontMatter('---\n"id": stable\npublish: true\n---\nbody',defaults);
+ assert.ok(!result.includes('id: "abcd"'));
+});

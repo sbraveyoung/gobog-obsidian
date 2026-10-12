@@ -10,6 +10,8 @@
  * persisted in the user's vault. Be conservative.
  */
 
+import { parseYaml } from "obsidian";
+
 export interface FrontMatterDefaults {
   title: string;
   author: string;
@@ -18,6 +20,15 @@ export interface FrontMatterDefaults {
   create_time: string;
   updated_time: string;
   draft?: boolean;
+  publish?: boolean;
+  tags?: string[];
+  description?: string;
+  category?: string;
+  hidden?: boolean;
+  private?: boolean;
+  pin?: boolean;
+  ai?: boolean;
+  cover?: string;
 }
 
 /** Generate a short hex id (8 hex chars from a fresh random source). */
@@ -42,8 +53,8 @@ export function generateId(): string {
  * collapses an existing block. If the file has no front matter, prepends a
  * fresh one with all the default keys.
  *
- * The YAML parsing is intentionally minimal — the file format is
- * "key: value" lines between `---` markers, matching what gobog reads.
+ * Parse keys using Obsidian’s YAML parser; keep the original block text so
+ * comments, custom properties and formatting remain intact.
  */
 export function ensureFrontMatter(body: string, defaults: FrontMatterDefaults): string {
   const { existingBlock, rest, hasBlock } = splitFrontMatter(body);
@@ -54,13 +65,14 @@ export function ensureFrontMatter(body: string, defaults: FrontMatterDefaults): 
     "id",
     "url",
     "create_time",
-    "updated_time",
+    "updated_time", "tags", "description", "category", "hidden", "private", "pin", "ai", "cover",
   ];
 
   if (!hasBlock) {
     const lines = ["---"];
-    for (const k of keys) lines.push(`${k}: ${JSON.stringify(defaults[k])}`);
+    for (const k of keys) if (defaults[k] !== undefined) lines.push(`${k}: ${JSON.stringify(defaults[k])}`);
     if (defaults.draft !== undefined) lines.push(`draft: ${defaults.draft}`);
+    if (defaults.publish !== undefined) lines.push(`publish: ${defaults.publish}`);
     lines.push("---", "");
     return lines.join("\n") + body;
   }
@@ -68,9 +80,10 @@ export function ensureFrontMatter(body: string, defaults: FrontMatterDefaults): 
   const present = parseKeys(existingBlock);
   const missing: string[] = [];
   for (const k of keys) {
-    if (!present.has(k)) missing.push(`${k}: ${JSON.stringify(defaults[k])}`);
+    if (!present.has(k) && defaults[k] !== undefined) missing.push(`${k}: ${JSON.stringify(defaults[k])}`);
   }
-  if (defaults.draft !== undefined && !["draft", "publish", "hidden", "private"].some(k => present.has(k))) missing.push(`draft: ${defaults.draft}`);
+  if (defaults.draft !== undefined && !["draft", "publish"].some(k => present.has(k))) missing.push(`draft: ${defaults.draft}`);
+  if (defaults.publish !== undefined && !present.has("publish") && !present.has("draft")) missing.push(`publish: ${defaults.publish}`);
   if (missing.length === 0) return body;
 
   // Insert missing keys right before the closing `---`. Preserves the
@@ -111,7 +124,7 @@ function splitFrontMatter(body: string): {
     }
   }
   if (closeIdx === -1) {
-    return { existingBlock: "", rest: body, hasBlock: false };
+    throw new Error("Front matter has no closing ---; fix YAML before filling metadata.");
   }
   const blockLines = lines.slice(0, closeIdx + 1);
   const restLines = lines.slice(closeIdx + 1);
@@ -123,11 +136,8 @@ function splitFrontMatter(body: string): {
 }
 
 function parseKeys(block: string): Set<string> {
-  const out = new Set<string>();
-  for (const line of block.split("\n")) {
-    if (line.startsWith("---")) continue;
-    const m = /^([A-Za-z][A-Za-z0-9_-]*)\s*:/.exec(line);
-    if (m) out.add(m[1]);
-  }
-  return out;
+  const lines = block.split("\n");
+  const values = parseYaml(lines.slice(1, -1).join("\n")) ?? {};
+  if (typeof values !== "object" || Array.isArray(values)) throw new Error("Front matter must be a YAML mapping.");
+  return new Set(Object.keys(values));
 }

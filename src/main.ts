@@ -1,6 +1,7 @@
 import {
   App,
   parseYaml,
+  stringifyYaml,
   FileSystemAdapter,
   Modal,
   Notice,
@@ -168,12 +169,25 @@ export default class GobogObsidianPlugin extends Plugin {
       name: "Fill front matter for the active file",
       checkCallback: (checking) => {
         const f = this.app.workspace.getActiveFile();
-        const ok = !!(f && this.isInsideBlogFolder(f.path));
+        const ok = !!(f && this.isArticlePath(f.path));
         if (!ok) return false;
         if (!checking) this.fillFrontMatterForFile(f!).catch((e) => this.fail(e));
         return true;
       },
     });
+
+    for (const hidden of [true, false]) {
+      this.addCommand({
+        id: hidden ? "folder-hide" : "folder-show",
+        name: hidden ? "Hide active note’s folder (including subfolders)" : "Show active note’s folder (parent hiding still applies)",
+        checkCallback: (checking) => {
+          const f = this.app.workspace.getActiveFile();
+          if (!f || !this.isInsideBlogFolder(f.path)) return false;
+          if (!checking) this.setActiveFolderHidden(hidden).catch(e => this.fail(e));
+          return true;
+        },
+      });
+    }
 
     // Preview blog locally — runs the gobog binary against the blog
     // folder, then opens the rendered HTML in the default browser. Needs
@@ -276,6 +290,35 @@ export default class GobogObsidianPlugin extends Plugin {
     return vaultPath === folder || vaultPath.startsWith(folder + "/");
   }
 
+  private isArticlePath(vaultPath: string): boolean {
+    if (!this.isInsideBlogFolder(vaultPath) || path.posix.basename(vaultPath) === "_folder.md") return false;
+    const rel = this.relPathInBlog(vaultPath);
+    return !rel.split("/").some(p => p.startsWith(".")) &&
+      ((rel.startsWith("post/") && rel.endsWith(".md")) || /^pages\/[^/]+\.md$/.test(rel));
+  }
+
+  async setActiveFolderHidden(hidden: boolean) {
+    const active = this.app.workspace.getActiveFile();
+    if (!active || !this.isInsideBlogFolder(active.path)) throw new Error("Open a note inside the blog folder first.");
+    const policyPath = path.posix.join(path.posix.dirname(active.path), "_folder.md");
+    const existing = this.app.vault.getAbstractFileByPath(policyPath);
+    let body = "\n此文件控制本目录及子目录的公开展示；父目录 hidden: true 时，子目录无法重新公开。\n";
+    let values: Record<string, unknown> = {};
+    if (existing) {
+      const original = await this.app.vault.read(existing as TFile);
+      const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(original);
+      if (!match) throw new Error("Folder policy must begin with valid YAML front matter.");
+      values = parseYaml(match[1]) ?? {};
+      if (typeof values !== "object" || Array.isArray(values)) throw new Error("Folder policy must be a YAML mapping.");
+      body = original.slice(match[0].length);
+    }
+    values.hidden = hidden;
+    const content = "---\n" + stringifyYaml(values) + "---\n" + body;
+    if (existing) await this.app.vault.modify(existing as TFile, content);
+    else await this.app.vault.create(policyPath, content);
+    new Notice(hidden ? "gobog: folder hidden; push to update the public site" : "gobog: folder veto cleared; parent and article switches still apply");
+  }
+
   /** vault.on("create") handler: stamp front matter on new notes. */
   private async onCreate(file: TAbstractFile) {
     if (!this.ready || this.syncBusy || !this.settings.autoFrontMatter) return;
@@ -284,7 +327,7 @@ export default class GobogObsidianPlugin extends Plugin {
     const rel = this.relPathInBlog(file.path);
     if (!rel.startsWith("post/") && !/^pages\/[^/]+\.md$/.test(rel)) return;
     if (rel.split("/").some(part => part.startsWith("."))) return;
-    if (!this.isInsideBlogFolder(file.path)) return;
+    if (!this.isArticlePath(file.path)) return;
     // Notes inside pages/ get a different url pattern (top-level slug).
     await this.fillFrontMatterForFile(file, true);
   }
@@ -308,6 +351,7 @@ export default class GobogObsidianPlugin extends Plugin {
 
   /** Fill in title / author / id / url / create_time / updated_time. */
   async fillFrontMatterForFile(file: TFile, isNew = false) {
+    if (!this.isArticlePath(file.path)) return;
     const abs = path.join(this.blogFolderAbs(), this.relPathInBlog(file.path));
     if (!fs.existsSync(abs)) return; // file may have been moved/deleted
     const isPage = this.relPathInBlog(file.path).startsWith("pages/");
@@ -323,7 +367,7 @@ export default class GobogObsidianPlugin extends Plugin {
       url,
       create_time: nowStamp(),
       updated_time: nowStamp(),
-      ...(isNew ? { draft: true } : {}),
+      ...(isNew ? { draft: true, publish: false, tags: [], description: "", category: "", hidden: false, private: false, pin: false, ai: false, cover: "" } : {}),
     };
     const after = ensureFrontMatter(before, defaults);
     if (after !== before) {
@@ -646,7 +690,7 @@ export default class GobogObsidianPlugin extends Plugin {
    *  is inside the blog folder, prefer its specific rendered path. */
   private previewURL(_previewDir: string): string {
     const active = this.app.workspace.getActiveFile();
-    if (active && this.isInsideBlogFolder(active.path)) {
+    if (active && this.isArticlePath(active.path)) {
       const rel = this.relPathInBlog(active.path);
       const meta = parseSimpleFrontMatter(fs.readFileSync(path.join(this.blogFolderAbs(), rel), "utf8"));
       let route = meta.url;
