@@ -106,14 +106,11 @@ Command palette:
 ## Diff confirmation
 
 By default every push (manual or auto) opens a modal showing
-`git diff --cached` and the proposed commit message. **Commit & Push**
-proceeds; **Cancel** un-stages everything and aborts (your working
-tree is left alone, so a subsequent save resumes normally). Long
-diffs scroll inside the modal; very large diffs are truncated with a
-pointer to `git diff --cached` so Obsidian doesn't hang trying to lay
-out hundreds of thousands of characters.
+a per-file review of the staged changes and the proposed commit message. The window has a searchable file list, addition/deletion counts, metadata before/after tables, publication and folder-policy notices, and colored body hunks with line numbers. Markdown properties are separate from the body by default; enable **包含属性原文** to inspect the raw header, or **展开全部上下文** to see the surrounding article. Large hunks load more rows on demand rather than truncating the whole review. Binary attachments are listed explicitly.
 
-If you'd rather push silently, turn off
+**提交并推送** commits and pushes every staged file; selecting a file only chooses what to inspect. **取消** (or closing the modal) unstages changes and leaves your files untouched. The review uses immutable Git snapshots, so edits made while the modal is open are not silently added to the commit. If another process changes the staged tree, the push aborts and asks you to review again. Publication notices describe article switches; parent folder rules and a successful website deployment still determine public visibility.
+
+To turn the confirmation off, use
 **Settings → Gobog Sync → Confirm diff before each push**.
 
 ## WeChat 公众号 (optional)
@@ -188,3 +185,7 @@ Run `npm ci`, `npm test`, and `npm run build`. Edit `src/`, then regenerate `mai
 Open a note in the folder and use **Hide active note’s folder (including subfolders)** or **Show active note’s folder (parent hiding still applies)**. Commands edit `_folder.md` with a `hidden` Boolean; parent hiding vetoes child publication, and article draft/publish/private flags still apply. These control notes never receive article front matter. Requires a gobog version supporting folder policies on both the local binary and the deployed renderer pin.
 
 New articles receive explicit draft/publication switches and YAML-list tags. Existing publication intent and custom metadata stay intact when filling missing properties. See the renderer’s [publishing guide](https://github.com/sbraveyoung/gobog/blob/master/docs/publishing-pipeline.zh-CN.md).
+
+## 0.5 push review
+
+Replaces the stacked raw patch with a theme-aware two-pane review. Source synchronization and publication rules are unchanged. `styles.css` is a required installation file alongside the generated `main.js` and `manifest.json`.

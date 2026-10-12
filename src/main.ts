@@ -21,11 +21,14 @@ import { spawn } from "child_process";
 import {
   gitPull,
   gitCommitAndPush,
-  gitStageAndDiff,
+  gitStageForReview,
+  gitReviewPatch,
   gitResetStaged,
   gitInitIfMissing,
   gitStatusSummary,
 } from "./git";
+import { ReviewSnapshot } from "./review";
+import { mountReviewView } from "./review-view";
 import { ensureFrontMatter, generateId, FrontMatterDefaults } from "./frontmatter";
 import { pushToWeChat, resetTokenCache } from "./wechat";
 import { getLatestDeploy, summarizeDeploy, DeployStatusResult } from "./deploy-status";
@@ -418,15 +421,15 @@ export default class GobogObsidianPlugin extends Plugin {
 
     const authorName = this.settings.gitName.trim() || this.settings.defaultAuthor || "obsidian";
     const authorEmail = this.settings.gitEmail.trim() || "obsidian@users.noreply.github.com";
-    const diff = await gitStageAndDiff(dir, authorName, authorEmail);
+    const review = await gitStageForReview(dir, authorName, authorEmail);
     const msg = renderCommitMessage(this.settings.commitTemplate, summary);
 
     // If diff-confirmation is on (default), show the modal and wait for
     // the user. The Cancel path un-stages everything so the next save
     // starts fresh.
     let approved = true;
-    if (this.settings.confirmBeforePush && diff !== null) {
-      approved = await this.confirmDiff(diff, msg);
+    if (this.settings.confirmBeforePush && review.files.length > 0) {
+      approved = await this.confirmDiff(dir, review, msg);
     }
     if (!approved) {
       await gitResetStaged(dir);
@@ -443,6 +446,7 @@ export default class GobogObsidianPlugin extends Plugin {
       authorName,
       authorEmail,
       commitMessage: msg,
+      reviewTree: review.tree,
     });
     new Notice(`gobog: source pushed (${summary.changedCount} files, ${summary.unpushedCommits} pending commits). Website deployment runs separately.`);
     this.setStatus("gobog: idle");
@@ -457,10 +461,10 @@ export default class GobogObsidianPlugin extends Plugin {
     } finally { this.syncBusy = false; }
   }
 
-  /** Show the diff in a modal and resolve true on confirm, false on cancel. */
-  private confirmDiff(diff: string, commitMsg: string): Promise<boolean> {
+  /** Review the immutable staged snapshot before committing. */
+  private confirmDiff(dir: string, review: ReviewSnapshot, commitMsg: string): Promise<boolean> {
     return new Promise((resolve) => {
-      new DiffConfirmModal(this.app, diff, commitMsg, resolve).open();
+      new DiffConfirmModal(this.app, review, commitMsg, (file, full) => gitReviewPatch(dir, review, file, full), resolve).open();
     });
   }
 
@@ -803,90 +807,22 @@ function stripProtocol(url: string): string {
   return "sbrave.cn";
 }
 
-/**
- * Modal that previews `git diff --cached` to the user before a commit
- * and resolves the supplied callback with true (Commit & Push) or false
- * (Cancel). The diff text is shown verbatim inside a <pre>; long diffs
- * scroll vertically inside the modal so the bottom buttons stay reachable.
- *
- * The patch portion of `git diff --stat --patch` can be enormous; cap
- * the displayed body at MAX_DIFF_CHARS so Obsidian doesn't hang trying
- * to lay out a 1-million-character block. The user gets a "[truncated]"
- * line and can always inspect the full diff via the standalone "Show
- * sync status" command or their terminal.
- */
+/** Host wrapper: cancellation still unstages, confirmation commits the reviewed tree. */
 class DiffConfirmModal extends Modal {
-  private static readonly MAX_DIFF_CHARS = 200_000;
-  private diff: string;
-  private commitMsg: string;
-  private resolve: (ok: boolean) => void;
   private resolved = false;
-
-  constructor(app: App, diff: string, commitMsg: string, resolve: (ok: boolean) => void) {
+  private dispose?: () => void;
+  constructor(app: App, private review: ReviewSnapshot, private commitMsg: string,
+    private loadPatch: Parameters<typeof mountReviewView>[3], private resolve: (ok: boolean) => void) {
     super(app);
-    this.diff = diff;
-    this.commitMsg = commitMsg;
-    this.resolve = resolve;
   }
-
   onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("gobog-diff-modal");
-
-    contentEl.createEl("h2", { text: "Review changes before pushing" });
-
-    contentEl.createEl("p", {
-      text: "Commit message:",
-      attr: { style: "margin: 8px 0 4px; color: var(--text-muted); font-size: 12px;" },
-    });
-    const msgEl = contentEl.createEl("pre", {
-      text: this.commitMsg,
-      attr: {
-        style:
-          "background: var(--background-secondary); padding: 8px 10px; border-radius: 4px; " +
-          "margin: 0 0 14px; font-size: 12px; white-space: pre-wrap; max-height: 80px; overflow: auto;",
-      },
-    });
-    void msgEl;
-
-    let body = this.diff;
-    if (body.length > DiffConfirmModal.MAX_DIFF_CHARS) {
-      body =
-        body.slice(0, DiffConfirmModal.MAX_DIFF_CHARS) +
-        `\n\n[…diff truncated — ${body.length - DiffConfirmModal.MAX_DIFF_CHARS} chars hidden. Run \`git diff --cached\` for the full view.]`;
-    }
-    contentEl.createEl("pre", {
-      text: body,
-      attr: {
-        style:
-          "background: var(--background-primary-alt); padding: 10px 12px; border-radius: 4px; " +
-          "font-family: var(--font-monospace); font-size: 12px; line-height: 1.45; " +
-          "max-height: 50vh; overflow: auto; white-space: pre; margin: 0;",
-      },
-    });
-
-    const buttonRow = contentEl.createDiv({ attr: { style: "margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end;" } });
-    const cancelBtn = buttonRow.createEl("button", { text: "Cancel" });
-    const okBtn = buttonRow.createEl("button", { text: "Commit & Push" });
-    okBtn.addClass("mod-cta");
-
-    cancelBtn.addEventListener("click", () => this.finish(false));
-    okBtn.addEventListener("click", () => this.finish(true));
+    this.modalEl.addClass("gobog-review-modal");
+    this.dispose = mountReviewView(this.contentEl, this.review, this.commitMsg, this.loadPatch, () => this.finish(false), () => this.finish(true));
   }
-
-  onClose() {
-    // If the user dismissed by clicking outside / pressing Esc, treat
-    // it as a cancel. resolve only fires once thanks to the guard.
-    this.finish(false);
-    this.contentEl.empty();
-  }
-
+  onClose() { this.dispose?.(); this.finish(false); this.contentEl.empty(); }
   private finish(ok: boolean) {
     if (this.resolved) return;
-    this.resolved = true;
-    this.resolve(ok);
-    this.close();
+    this.resolved = true; this.resolve(ok); this.close();
   }
 }
 

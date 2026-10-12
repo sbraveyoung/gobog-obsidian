@@ -1,6 +1,6 @@
 {
   "name": "gobog-obsidian",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Two-way sync between an Obsidian folder and a GitHub markdown repo, with auto front-matter for new notes. Companion to the gobog blog engine.",
   "main": "main.js",
   "scripts": {
@@ -25,6 +25,7 @@
     "@types/node": "^20.11.0",
     "builtin-modules": "^3.3.0",
     "esbuild": "^0.28.2",
+    "linkedom": "0.18.12",
     "obsidian": "^1.5.7",
     "tslib": "^2.6.2",
     "typescript": "^5.4.0",

@@ -1,0 +1,75 @@
+/* Match Obsidian's theme; the review is an editor tool, not a website. */
+.modal.gobog-review-modal { width: min(1180px, 94vw); max-width: 94vw; height: min(850px, 90vh); max-height: 90vh; padding: 22px 24px 16px; }
+.gobog-review-modal .modal-content { margin: 0; height: 100%; min-height: 0; overflow: hidden; }
+.gobog-review { display: flex; flex-direction: column; gap: 14px; height: 100%; color: var(--text-normal); }
+.gobog-review h2 { margin: 0 0 6px; font-size: 22px; }
+.gobog-review h3 { margin: 0 0 6px; font-size: 20px; }
+.gobog-review h4 { margin: 18px 0 10px; font-size: 14px; }
+.gobog-review p { margin: 0; }
+.gobog-review-summary, .gobog-review-type, .gobog-review-footnote { color: var(--text-muted); font-size: 12px; line-height: 1.6; }
+.gobog-review-commit { margin-top: 6px; font-size: 12px; color: var(--text-muted); }
+.gobog-review-commit summary { cursor: pointer; }
+.gobog-review-commit pre { white-space: pre-wrap; max-height: 65px; overflow: auto; margin: 6px 0 0; }
+.gobog-review-workspace { display: grid; grid-template-columns: 280px minmax(0, 1fr); flex: 1; min-height: 0; border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
+.gobog-review-files { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--background-modifier-border); background: var(--background-secondary); }
+.gobog-review-search { margin: 12px; width: calc(100% - 24px); flex-shrink: 0; }
+.gobog-review-file-list { overflow-y: auto; flex: 1; padding: 0 6px 10px; }
+.gobog-review-file { display: flex; flex-direction: column; align-items: stretch; gap: 5px; width: 100%; height: auto; padding: 12px 10px; margin: 0 0 3px; text-align: left; background: transparent; border: 1px solid transparent; box-shadow: none; color: var(--text-normal); }
+.gobog-review-file[hidden] { display: none; }
+.gobog-review-file:hover { background: var(--background-modifier-hover); }
+.gobog-review-file.is-active { border-color: var(--interactive-accent); background: var(--background-primary); }
+.gobog-review-file-top { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }
+.gobog-review-status { font-weight: 600; }
+.gobog-review .status-A, .gobog-review-new { color: var(--text-success, #27864c); }
+.gobog-review .status-D, .gobog-review-old { color: var(--text-error, #c94747); }
+.gobog-review-count { color: var(--text-muted); font-family: var(--font-monospace); }
+.gobog-review-file-title { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; white-space: normal; line-height: 1.5; }
+.gobog-review-file-path { font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; white-space: normal; line-height: 1.5; }
+.gobog-review-file-notice { color: var(--text-warning, #b57618); font-size: 11px; }
+.gobog-review-detail { overflow: auto; min-width: 0; padding: 20px; }
+.gobog-review-path { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; padding-bottom: 8px; }
+.gobog-review-notice { margin-top: 12px; border-left: 3px solid var(--text-warning, #b57618); background: var(--background-secondary); padding: 10px 12px; font-size: 13px; line-height: 1.6; }
+.gobog-review-properties { overflow: auto; border: 1px solid var(--background-modifier-border); border-radius: 4px; }
+.gobog-review-properties table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 0; }
+.gobog-review-properties th, .gobog-review-properties td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--background-modifier-border); vertical-align: top; overflow-wrap: anywhere; white-space: pre-wrap; max-width: 280px; }
+.gobog-review-properties thead { color: var(--text-muted); background: var(--background-secondary); }
+.gobog-review-properties tbody th { font-family: var(--font-monospace); font-weight: 400; }
+.gobog-review-properties .is-publication th { font-weight: 700; }
+.gobog-review-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin: 20px 0 10px; }
+.gobog-review-controls h4 { margin: 0; margin-right: auto; }
+.gobog-review-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); cursor: pointer; }
+.gobog-review-toggle input { margin: 0; }
+.gobog-review-hunk { border: 1px solid var(--background-modifier-border); border-radius: 4px; overflow: hidden; margin-bottom: 14px; }
+.gobog-review-hunk-heading { padding: 7px 10px; background: var(--background-secondary); color: var(--text-muted); font-family: var(--font-monospace); font-size: 11px; white-space: pre-wrap; }
+.gobog-review-lines { overflow-x: auto; }
+.gobog-review-line { display: flex; min-width: 100%; width: max-content; font-size: 12px; line-height: 1.75; font-family: var(--font-monospace); }
+.gobog-review-line-numbers { width: 76px; flex-shrink: 0; white-space: pre; text-align: right; padding: 0 8px; color: var(--text-faint); user-select: none; font-variant-numeric: tabular-nums; tab-size: 4; }
+.gobog-review-line-sign { width: 22px; flex-shrink: 0; text-align: center; }
+.gobog-review-line code { flex: 1; font: inherit; padding: 0 12px 0 0; white-space: pre; color: inherit; background: transparent; border: none; }
+.gobog-review .line-add { background: rgba(38, 157, 78, .12); }
+.gobog-review .line-delete { background: rgba(221, 64, 64, .12); }
+.gobog-review .line-add .gobog-review-line-sign { color: var(--text-success, #27864c); }
+.gobog-review .line-delete .gobog-review-line-sign { color: var(--text-error, #c94747); }
+.gobog-review-line mark { color: inherit; border-radius: 2px; background: rgba(38, 157, 78, .24); }
+.gobog-review .line-delete mark { background: rgba(221, 64, 64, .24); }
+.gobog-review .line-note { color: var(--text-muted); }
+.gobog-review-empty { padding: 16px 10px; color: var(--text-muted); font-size: 13px; line-height: 1.6; }
+.gobog-review-more { display: block; margin: 10px auto; }
+.gobog-review-more[hidden] { display: none; }
+.gobog-review-footer { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.gobog-review-footnote { margin-right: auto; }
+.gobog-review button:focus-visible, .gobog-review input:focus-visible, .gobog-review summary:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
+@media (max-width: 850px) {
+  .modal.gobog-review-modal { padding: 16px; }
+  .gobog-review-workspace { grid-template-columns: 210px minmax(0, 1fr); }
+  .gobog-review-detail { padding: 14px; }
+  .gobog-review-footnote { max-width: 45%; }
+}
+@media (max-width: 600px) {
+  .gobog-review-workspace { display: flex; flex-direction: column; }
+  .gobog-review-files { height: 170px; flex-shrink: 0; border-right: 0; border-bottom: 1px solid var(--background-modifier-border); }
+  .gobog-review-detail { flex: 1; }
+  .gobog-review-summary { font-size: 11px; }
+  .gobog-review-footnote { display: none; }
+  .gobog-review-footer { justify-content: flex-end; }
+}

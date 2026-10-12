@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { describeReviewFile, ReviewFile, ReviewSnapshot } from "./review";
 
 /* git.ts — markdown source sync between the Obsidian vault folder and the
  * blog repo on GitHub. The plugin runs `git` from PATH; we never bundle a
@@ -15,6 +16,8 @@ export interface PushOpts {
   authorName: string;
   authorEmail: string;
   commitMessage: string;
+  /** Staged tree shown in the confirmation dialog. */
+  reviewTree?: string;
 }
 
 export interface StatusSummary {
@@ -164,6 +167,9 @@ export async function gitCommitAndPush(
   // user took long enough that another process committed. Cheap.
   const branch = (await gitOut(["symbolic-ref", "--short", "HEAD"], dir)).trim();
   if (branch !== opts.branch) throw new Error(`Current branch ${branch} differs from configured ${opts.branch}; switch branches before pushing.`);
+  if (opts.reviewTree && (await gitOut(["write-tree"], dir)).trim() !== opts.reviewTree) {
+    throw new Error("The staged changes changed after review. 请重新检查差异后推送。");
+  }
   const staged = await gitOut(["diff", "--cached", "--name-only"], dir);
   if (staged.trim()) await git(["commit", "-m", opts.commitMessage], dir);
   // A failed push may have left a clean tree with pending commits.
@@ -242,10 +248,58 @@ function gitOut(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("git", args, { cwd, env: gitEnv(), stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
-    child.stdout.on("data", (b) => (out += b.toString()));
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (b) => (out += b));
     child.once("error", reject);
     child.once("close", (code) =>
       code === 0 ? resolve(out) : reject(new Error(`git ${args[0]} exited ${code}`)),
     );
   });
+}
+
+
+/** Capture immutable Git objects so the dialog remains accurate while the author edits. */
+export async function gitStageForReview(dir: string, authorName: string, authorEmail: string): Promise<ReviewSnapshot> {
+  await git(["config", "user.name", authorName], dir);
+  await git(["config", "user.email", authorEmail], dir);
+  await git(["add", "-A"], dir);
+  const tree = (await gitOut(["write-tree"], dir)).trim();
+  const head = await gitOut(["rev-parse", "--verify", "HEAD"], dir).then(s=>s.trim(),()=>"");
+  const base = head || (await gitOut(["hash-object", "-t", "tree", "--stdin"], dir)).trim();
+  const status = (await gitOut(["diff", "--name-status", "-z", "--find-renames", base, tree],dir)).split("\0");
+  const files: ReviewFile[]=[];
+  for (let i=0; i<status.length && status[i];) {
+    const code=status[i++]; const old=status[i++];
+    const renamed=code.startsWith("R") || code.startsWith("C");
+    files.push({path:renamed ? status[i++] : old,oldPath:renamed ? old : undefined,status:code[0],additions:0,deletions:0,binary:false,kind:"file",title:"",properties:[],notices:[]});
+  }
+  const stats=(await gitOut(["diff","--numstat","-z","--find-renames",base,tree],dir)).split("\0");
+  const counts=new Map<string,{additions:number;deletions:number;binary:boolean}>();
+  for(let i=0; i<stats.length && stats[i];) {
+    const record=stats[i++]; const first=record.indexOf("\t"), second=record.indexOf("\t",first+1);
+    const add=record.slice(0,first), del=record.slice(first+1,second); let name=record.slice(second+1);
+    if (!name) { i++; name=stats[i++]; }
+    counts.set(name,{additions:Number(add)||0,deletions:Number(del)||0,binary:add==="-"});
+  }
+  let cursor=0;
+  await Promise.all(Array.from({length:Math.min(6,files.length)},async()=>{
+    while(cursor<files.length) {
+      const f=files[cursor++];Object.assign(f,counts.get(f.path));
+      let before: string|undefined, after: string|undefined;
+      if (/\.md$/i.test(f.path) && !f.binary) {
+        const read=async(ref:string,p:string)=>{
+          const size=Number((await gitOut(["cat-file","-s",`${ref}:${p}`],dir)).trim());
+          if(size>2*1024*1024){f.contentSkipped=true;return undefined;}
+          return gitOut(["show",`${ref}:${p}`],dir);
+        };
+        [before,after]=await Promise.all([head && f.status!=="A" ? read(head,f.oldPath||f.path) : undefined,f.status!=="D" ? read(tree,f.path) : undefined]);
+      }
+      describeReviewFile(f,before,after);
+    }
+  }));
+  return {tree,head:base,files};
+}
+
+export async function gitReviewPatch(dir:string,review:ReviewSnapshot,file:ReviewFile,fullContext=false):Promise<string> {
+  return gitOut(["--literal-pathspecs","-c","core.quotePath=false","diff","--no-color","--no-ext-diff","--no-textconv",fullContext ? "--unified=1000000" : "--unified=3",review.head,review.tree,"--",file.oldPath || file.path,...(file.oldPath ? [file.path] : [])],dir);
 }
