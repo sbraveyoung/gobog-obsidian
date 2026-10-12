@@ -1,5 +1,6 @@
 import {
   App,
+  parseYaml,
   FileSystemAdapter,
   Modal,
   Notice,
@@ -13,6 +14,8 @@ import {
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
+import * as http from "http";
+import { startPreviewServer } from "./preview";
 import { spawn } from "child_process";
 import {
   gitPull,
@@ -131,6 +134,10 @@ const DEFAULTS: GobogObsidianSettings = {
 export default class GobogObsidianPlugin extends Plugin {
   settings: GobogObsidianSettings = DEFAULTS;
   /** Pending push debounce timer. Reset on every save while the plugin is auto-pushing. */
+  private syncBusy = false;
+  private ready = false;
+  private previewServer: http.Server | null = null;
+  private previewOrigin = "";
   private pushTimer: ReturnType<typeof setTimeout> | null = null;
   /** Status-bar element so the user can glance at sync state. */
   private statusEl: HTMLElement | null = null;
@@ -210,16 +217,23 @@ export default class GobogObsidianPlugin extends Plugin {
     // Hooks. We register through this.registerEvent so they're cleaned up
     // automatically on plugin unload — Obsidian leaks event handlers
     // otherwise.
-    if (this.settings.autoFrontMatter) {
+    {
       this.registerEvent(
         this.app.vault.on("create", (file) => this.onCreate(file).catch((e) => this.fail(e))),
       );
     }
-    if (this.settings.autoPushOnSave) {
+    {
       this.registerEvent(
         this.app.vault.on("modify", (file) => this.onModify(file)),
       );
     }
+
+    this.registerEvent(this.app.vault.on("delete", (file) => this.onModify(file)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (this.isInsideBlogFolder(oldPath)) this.schedulePush();
+      this.onModify(file);
+    }));
+    this.app.workspace.onLayoutReady(() => { this.ready = true; });
 
     // First-run pull. Deferred slightly so the workspace is ready and
     // any vault.on("create") events from initial scan have settled.
@@ -249,6 +263,8 @@ export default class GobogObsidianPlugin extends Plugin {
       throw new Error("Blog folder is empty — set it in plugin settings (e.g. \"Blog\").");
     }
     const abs = path.resolve(adapter.getBasePath(), rel);
+    const base = path.resolve(adapter.getBasePath());
+    if (abs === base || !abs.startsWith(base + path.sep)) throw new Error("Blog folder must be a subfolder inside this vault.");
     fs.mkdirSync(abs, { recursive: true });
     return abs;
   }
@@ -262,18 +278,26 @@ export default class GobogObsidianPlugin extends Plugin {
 
   /** vault.on("create") handler: stamp front matter on new notes. */
   private async onCreate(file: TAbstractFile) {
+    if (!this.ready || this.syncBusy || !this.settings.autoFrontMatter) return;
     if (!(file instanceof TFile)) return;
     if (file.extension !== "md") return;
+    const rel = this.relPathInBlog(file.path);
+    if (!rel.startsWith("post/") && !/^pages\/[^/]+\.md$/.test(rel)) return;
+    if (rel.split("/").some(part => part.startsWith("."))) return;
     if (!this.isInsideBlogFolder(file.path)) return;
     // Notes inside pages/ get a different url pattern (top-level slug).
-    await this.fillFrontMatterForFile(file);
+    await this.fillFrontMatterForFile(file, true);
   }
 
   /** vault.on("modify") handler: schedule a debounced auto-push. */
   private onModify(file: TAbstractFile) {
     if (!(file instanceof TFile)) return;
     if (!this.isInsideBlogFolder(file.path)) return;
-    if (!this.settings.autoPushOnSave) return;
+    this.schedulePush();
+  }
+
+  private schedulePush() {
+    if (!this.ready || this.syncBusy || !this.settings.autoPushOnSave) return;
     if (this.pushTimer) clearTimeout(this.pushTimer);
     this.setStatus(`gobog: push scheduled in ${this.settings.autoPushDebounceSec}s`);
     this.pushTimer = setTimeout(() => {
@@ -283,12 +307,14 @@ export default class GobogObsidianPlugin extends Plugin {
   }
 
   /** Fill in title / author / id / url / create_time / updated_time. */
-  async fillFrontMatterForFile(file: TFile) {
+  async fillFrontMatterForFile(file: TFile, isNew = false) {
     const abs = path.join(this.blogFolderAbs(), this.relPathInBlog(file.path));
     if (!fs.existsSync(abs)) return; // file may have been moved/deleted
     const isPage = this.relPathInBlog(file.path).startsWith("pages/");
     const basename = path.basename(file.path, ".md");
-    const id = generateId();
+    const before = fs.readFileSync(abs, "utf8");
+    const meta = parseSimpleFrontMatter(before);
+    const id = meta.id || generateId();
     const url = isPage ? "/" + slugify(basename) : this.settings.urlPattern.replace(/\{\{id\}\}/g, id);
     const defaults: FrontMatterDefaults = {
       title: basename,
@@ -297,8 +323,8 @@ export default class GobogObsidianPlugin extends Plugin {
       url,
       create_time: nowStamp(),
       updated_time: nowStamp(),
+      ...(isNew ? { draft: true } : {}),
     };
-    const before = fs.readFileSync(abs, "utf8");
     const after = ensureFrontMatter(before, defaults);
     if (after !== before) {
       fs.writeFileSync(abs, after, "utf8");
@@ -317,6 +343,9 @@ export default class GobogObsidianPlugin extends Plugin {
   // ---------- sync commands ----------
 
   async runPull() {
+    if (this.syncBusy) throw new Error("A blog sync is already in progress.");
+    this.syncBusy = true;
+    try {
     this.requireRepoConfigured();
     const dir = this.blogFolderAbs();
     this.setStatus("gobog: pulling…");
@@ -324,15 +353,20 @@ export default class GobogObsidianPlugin extends Plugin {
     await gitPull(dir, this.settings.branch, this.settings.repoUrl, this.settings.githubToken);
     new Notice("gobog: pulled latest from blog repo");
     this.setStatus("gobog: idle");
+    } finally { this.syncBusy = false; }
   }
 
   async runPush() {
+    if (this.syncBusy) throw new Error("A blog sync is already in progress.");
+    this.syncBusy = true;
+    const pushStartedAt = new Date().toISOString();
+    try {
     this.requireRepoConfigured();
     const dir = this.blogFolderAbs();
     this.setStatus("gobog: staging…");
     await gitInitIfMissing(dir, this.settings.repoUrl, this.settings.branch, this.settings.githubToken);
     const summary = await gitStatusSummary(dir);
-    if (summary.changedCount === 0) {
+    if (summary.changedCount === 0 && summary.unpushedCommits === 0) {
       new Notice("gobog: nothing to push");
       this.setStatus("gobog: idle");
       return;
@@ -341,20 +375,13 @@ export default class GobogObsidianPlugin extends Plugin {
     const authorName = this.settings.gitName.trim() || this.settings.defaultAuthor || "obsidian";
     const authorEmail = this.settings.gitEmail.trim() || "obsidian@users.noreply.github.com";
     const diff = await gitStageAndDiff(dir, authorName, authorEmail);
-    if (diff === null) {
-      // Race: status said dirty, but a sibling process cleaned up before us.
-      new Notice("gobog: nothing to push (cleaned up between status + stage)");
-      this.setStatus("gobog: idle");
-      return;
-    }
-
     const msg = renderCommitMessage(this.settings.commitTemplate, summary);
 
     // If diff-confirmation is on (default), show the modal and wait for
     // the user. The Cancel path un-stages everything so the next save
     // starts fresh.
     let approved = true;
-    if (this.settings.confirmBeforePush) {
+    if (this.settings.confirmBeforePush && diff !== null) {
       approved = await this.confirmDiff(diff, msg);
     }
     if (!approved) {
@@ -373,7 +400,7 @@ export default class GobogObsidianPlugin extends Plugin {
       authorEmail,
       commitMessage: msg,
     });
-    new Notice(`gobog: pushed ${summary.changedCount} file(s)`);
+    new Notice(`gobog: source pushed (${summary.changedCount} files, ${summary.unpushedCommits} pending commits). Website deployment runs separately.`);
     this.setStatus("gobog: idle");
 
     // Optional: after a successful push, give the github.io deploy
@@ -381,8 +408,9 @@ export default class GobogObsidianPlugin extends Plugin {
     // status bar. Closes the "did the push actually publish?" loop
     // without leaving Obsidian.
     if (this.settings.deployStatusEnabled) {
-      this.scheduleDeployStatusCheck();
+      this.scheduleDeployStatusCheck(pushStartedAt);
     }
+    } finally { this.syncBusy = false; }
   }
 
   /** Show the diff in a modal and resolve true on confirm, false on cancel. */
@@ -401,8 +429,9 @@ export default class GobogObsidianPlugin extends Plugin {
         ? "gobog: clean (no local changes)"
         : `gobog: ${summary.changedCount} change(s) — ${summary.changedPaths.slice(0, 4).join(", ")}` +
           (summary.changedPaths.length > 4 ? "…" : "");
-    new Notice(text, 8000);
-    this.setStatus(text);
+    const full = text + (summary.unpushedCommits ? `; ${summary.unpushedCommits} commit(s) waiting to push` : "");
+    new Notice(full, 8000);
+    this.setStatus(full);
   }
 
   /**
@@ -458,10 +487,10 @@ export default class GobogObsidianPlugin extends Plugin {
    * to 5000/h and (b) it lets the same code work if the user ever
    * makes the github.io repo private.
    */
-  async runDeployStatusCheck() {
+  async runDeployStatusCheck(createdAfter?: string): Promise<boolean> {
     if (!this.settings.deployStatusEnabled) {
       new Notice("gobog: deploy status echo is off — turn on in Settings → Deploy status.");
-      return;
+      return true;
     }
     const repo = this.settings.deployStatusRepo.trim();
     if (!repo) {
@@ -472,11 +501,12 @@ export default class GobogObsidianPlugin extends Plugin {
       repo,
       workflow: this.settings.deployStatusWorkflow.trim() || "deploy.yml",
       token: this.settings.githubToken,
+      createdAfter,
     });
     if (!result) {
-      this.setStatus("gobog: no deploy runs found");
-      new Notice(`gobog: no runs found for ${repo} / ${this.settings.deployStatusWorkflow}`);
-      return;
+      this.setStatus(createdAfter ? "gobog: source pushed, waiting for deploy workflow…" : "gobog: no deploy runs found");
+      if (!createdAfter) new Notice(`gobog: no runs found for ${repo} / ${this.settings.deployStatusWorkflow}`);
+      return false;
     }
     const summary = summarizeDeploy(result);
     this.setStatus(`gobog: ${summary}`);
@@ -484,7 +514,8 @@ export default class GobogObsidianPlugin extends Plugin {
       `gobog: ${summary}\n` +
       (result.headCommitMsg ? result.headCommitMsg + "\n" : "") +
       result.htmlUrl;
-    new Notice(noticeBody, 14000);
+    if (!createdAfter || result.status === "completed") new Notice(noticeBody, 14000);
+    return result.status === "completed";
   }
 
   /**
@@ -493,13 +524,16 @@ export default class GobogObsidianPlugin extends Plugin {
    * to one timer.
    */
   private deployStatusTimer: ReturnType<typeof setTimeout> | null = null;
-  private scheduleDeployStatusCheck() {
+  private scheduleDeployStatusCheck(createdAfter?: string, attempt = 0) {
     if (this.deployStatusTimer) clearTimeout(this.deployStatusTimer);
     const delayMs = Math.max(5, this.settings.deployStatusPollDelaySec) * 1000;
     this.setStatus(`gobog: deploy check in ${Math.round(delayMs / 1000)}s`);
     this.deployStatusTimer = setTimeout(() => {
       this.deployStatusTimer = null;
-      this.runDeployStatusCheck().catch((e) => this.fail(e));
+      this.runDeployStatusCheck(createdAfter).then((done) => {
+        if (!done && attempt < 19) this.scheduleDeployStatusCheck(createdAfter, attempt + 1);
+        else if (!done) this.setStatus("gobog: deploy not confirmed; check latest workflow status");
+      }).catch((e) => this.fail(e));
     }, delayMs);
   }
 
@@ -523,7 +557,9 @@ export default class GobogObsidianPlugin extends Plugin {
     if (!fs.existsSync(bin)) {
       throw new Error(`gobog binary not found at ${bin}`);
     }
-    const sourceAbs = this.blogFolderAbs();
+    const previewSource = fs.mkdtempSync(path.join(os.tmpdir(), "gobog-preview-source-"));
+    const sourceAbs = path.join(previewSource, "source");
+    fs.cpSync(this.blogFolderAbs(), sourceAbs, { recursive: true, filter: (p) => path.basename(p) !== ".git" });
     const themeAbs =
       this.settings.themePath.trim() ||
       path.resolve(path.dirname(bin), "themes", "minimal");
@@ -535,6 +571,8 @@ export default class GobogObsidianPlugin extends Plugin {
     }
 
     const previewDir = this.previewOutputDir();
+    this.previewServer?.close(); this.previewServer = null;
+    fs.rmSync(previewDir, { recursive: true, force: true });
     fs.mkdirSync(previewDir, { recursive: true });
     const cfgPath = this.writePreviewConfig(sourceAbs, themeAbs);
 
@@ -542,9 +580,12 @@ export default class GobogObsidianPlugin extends Plugin {
     try {
       await this.spawnGobog(bin, cfgPath, previewDir);
     } finally {
-      try { fs.rmSync(path.dirname(cfgPath), { recursive: true, force: true }); } catch (_) { /* best-effort */ }
+      try { fs.rmSync(path.dirname(cfgPath), { recursive: true, force: true }); fs.rmSync(previewSource, { recursive: true, force: true }); } catch (_) { /* best-effort */ }
     }
 
+    const preview = await startPreviewServer(previewDir);
+    this.previewServer = preview.server;
+    this.previewOrigin = preview.origin;
     const url = this.previewURL(previewDir);
     new Notice(`gobog: preview ready → ${url}`, 10000);
     this.setStatus("gobog: preview ready");
@@ -603,23 +644,22 @@ export default class GobogObsidianPlugin extends Plugin {
 
   /** Build the file:// URL we hand to the browser. If the active file
    *  is inside the blog folder, prefer its specific rendered path. */
-  private previewURL(previewDir: string): string {
+  private previewURL(_previewDir: string): string {
     const active = this.app.workspace.getActiveFile();
     if (active && this.isInsideBlogFolder(active.path)) {
       const rel = this.relPathInBlog(active.path);
-      // post/foo/bar.md → post/foo/bar/index.html
-      if (rel.startsWith("post/")) {
-        const stripped = rel.replace(/\.md$/, "");
-        const candidate = path.join(previewDir, stripped, "index.html");
-        if (fs.existsSync(candidate)) return "file://" + candidate;
-      }
-      if (rel.startsWith("pages/")) {
-        const name = path.basename(rel, ".md");
-        const candidate = path.join(previewDir, name, "index.html");
-        if (fs.existsSync(candidate)) return "file://" + candidate;
-      }
+      const meta = parseSimpleFrontMatter(fs.readFileSync(path.join(this.blogFolderAbs(), rel), "utf8"));
+      let route = meta.url;
+      if (!route) route = rel.startsWith("pages/") ? "/" + slugify(path.basename(rel, ".md")) : "/" + rel.replace(/\.md$/, "").split("/").map(slugify).join("/");
+      if (route.startsWith("/") && !route.startsWith("//")) return this.previewOrigin + route.replace(/\/$/, "") + "/";
     }
-    return "file://" + path.join(previewDir, "index.html");
+    return this.previewOrigin + "/";
+  }
+
+  onunload() {
+    if (this.pushTimer) clearTimeout(this.pushTimer);
+    if (this.deployStatusTimer) clearTimeout(this.deployStatusTimer);
+    this.previewServer?.close();
   }
 
   private spawnGobog(bin: string, cfgPath: string, outputDir: string): Promise<void> {
@@ -707,19 +747,12 @@ function renderCommitMessage(
  *  (title, author, url) for the WeChat path. Anything more elaborate is
  *  left to the gobog scanner. */
 function parseSimpleFrontMatter(md: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!md.startsWith("---")) return out;
-  const end = md.indexOf("\n---", 3);
-  if (end < 0) return out;
-  for (const line of md.slice(3, end).split("\n")) {
-    const m = /^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$/.exec(line);
-    if (m) out[m[1].toLowerCase()] = m[2];
-  }
-  return out;
+ const m = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(md);
+ if (!m) return {};
+ const values = parseYaml(m[1]) || {};
+ return Object.fromEntries(Object.entries(values).filter(([,v]) => v != null).map(([k,v]) => [k,String(v)]));
 }
 
-/** "https://github.com/sbraveyoung/blog.git" → "sbrave.cn". Used so the
- *  WeChat "原文链接" points back at the blog domain rather than github.com. */
 function stripProtocol(url: string): string {
   // For now we hard-code: anything that looks like a github repo URL maps
   // to sbrave.cn. Users with a different domain can edit the source.

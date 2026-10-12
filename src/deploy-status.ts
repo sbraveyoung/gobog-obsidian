@@ -7,7 +7,7 @@
  * The plugin doesn't authenticate to *act* on the workflow; we only
  * read run metadata. Public repos work without a token; private repos
  * use the same GitHub token the user already configured for git
- * pushes (Contents: Read is enough for the runs endpoint).
+ * pushes (Actions: Read is required for private workflow runs).
  */
 
 import { requestUrl } from "obsidian";
@@ -19,6 +19,7 @@ export interface DeployStatusOptions {
   workflow: string;
   /** Optional bearer token. Empty string → unauthenticated public read. */
   token: string;
+  createdAfter?: string;
 }
 
 export interface DeployStatusResult {
@@ -37,20 +38,24 @@ export interface DeployStatusResult {
 export async function getLatestDeploy(opts: DeployStatusOptions): Promise<DeployStatusResult | null> {
   const url =
     `https://api.github.com/repos/${opts.repo}/actions/workflows/` +
-    `${encodeURIComponent(opts.workflow)}/runs?per_page=1`;
+    `${encodeURIComponent(opts.workflow)}/runs?per_page=10`;
   const headers: Record<string, string> = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (opts.token) headers["Authorization"] = `Bearer ${opts.token}`;
 
-  const res = await requestUrl({ url, method: "GET", headers, throw: false });
+  let res = await requestUrl({ url, method: "GET", headers, throw: false });
+  if (opts.token && [401,403,404].includes(res.status)) {
+    delete headers.Authorization;
+    res = await requestUrl({ url, method: "GET", headers, throw: false });
+  }
   if (res.status >= 400) {
     const body = (res.text || "").slice(0, 200);
     throw new Error(`GitHub API ${res.status}: ${body}`);
   }
   const data = JSON.parse(res.text);
-  const run = data.workflow_runs?.[0];
+  const run = data.workflow_runs?.find((r: {created_at: string}) => !opts.createdAfter || r.created_at >= opts.createdAfter);
   if (!run) return null;
   return {
     id: run.id,

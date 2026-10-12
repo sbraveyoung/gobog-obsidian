@@ -17,6 +17,7 @@ export interface FrontMatterDefaults {
   url: string;
   create_time: string;
   updated_time: string;
+  draft?: boolean;
 }
 
 /** Generate a short hex id (8 hex chars from a fresh random source). */
@@ -58,7 +59,8 @@ export function ensureFrontMatter(body: string, defaults: FrontMatterDefaults): 
 
   if (!hasBlock) {
     const lines = ["---"];
-    for (const k of keys) lines.push(`${k}: ${defaults[k]}`);
+    for (const k of keys) lines.push(`${k}: ${JSON.stringify(defaults[k])}`);
+    if (defaults.draft !== undefined) lines.push(`draft: ${defaults.draft}`);
     lines.push("---", "");
     return lines.join("\n") + body;
   }
@@ -66,8 +68,9 @@ export function ensureFrontMatter(body: string, defaults: FrontMatterDefaults): 
   const present = parseKeys(existingBlock);
   const missing: string[] = [];
   for (const k of keys) {
-    if (!present.has(k)) missing.push(`${k}: ${defaults[k]}`);
+    if (!present.has(k)) missing.push(`${k}: ${JSON.stringify(defaults[k])}`);
   }
+  if (defaults.draft !== undefined && !["draft", "publish", "hidden", "private"].some(k => present.has(k))) missing.push(`draft: ${defaults.draft}`);
   if (missing.length === 0) return body;
 
   // Insert missing keys right before the closing `---`. Preserves the
@@ -95,7 +98,7 @@ function splitFrontMatter(body: string): {
   rest: string;
   hasBlock: boolean;
 } {
-  if (!body.startsWith("---")) {
+  if (!/^---[ \t]*\r?\n/.test(body)) {
     return { existingBlock: "", rest: body, hasBlock: false };
   }
   // Find the closing `---` on its own line (allow trailing whitespace).

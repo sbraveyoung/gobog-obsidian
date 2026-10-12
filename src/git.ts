@@ -20,84 +20,16 @@ export interface PushOpts {
 export interface StatusSummary {
   changedCount: number;
   changedPaths: string[];
+  unpushedCommits: number;
 }
 
 /** True when `dir` already contains a `.git` directory. */
 function isGitRepo(dir: string): boolean {
   try {
-    return fs.statSync(path.join(dir, ".git")).isDirectory();
+    const info = fs.statSync(path.join(dir, ".git"));
+    return info.isDirectory() || (info.isFile() && fs.readFileSync(path.join(dir, ".git"), "utf8").startsWith("gitdir: "));
   } catch {
     return false;
-  }
-}
-
-/**
- * Remove `.lock` files left behind by a previous git process that
- * crashed or was killed mid-write (Obsidian force-quit, network drop
- * during push, signal kill). Covers:
- *
- *   - `.git/index.lock`           — taken by add / commit / checkout
- *   - `.git/HEAD.lock`            — HEAD update
- *   - `.git/config.lock`          — config edits
- *   - `.git/packed-refs.lock`     — ref packing
- *   - `.git/shallow.lock`         — fetch with --depth=N (we use this)
- *   - `.git/FETCH_HEAD.lock`      — fetch
- *   - `.git/refs/**\/*.lock`      — per-ref locks (e.g. refs/heads/master.lock)
- *
- * Anything older than `maxAgeMs` (default 30s) is treated as stale —
- * a real git operation finishes in well under a second, so a lock
- * sitting around for half a minute can't belong to a live process.
- * Fresh locks are left alone in case the user actually has a
- * concurrent git running in a terminal.
- *
- * Idempotent: no-op when nothing stale is present. Per-file failures
- * (EBUSY / permission) are logged but not raised — we let the
- * subsequent git command surface its own real error message rather
- * than masking it here.
- */
-function clearStaleGitLocks(dir: string, maxAgeMs = 30_000): void {
-  const gitDir = path.join(dir, ".git");
-  const candidates: string[] = [];
-
-  // Top-level .git/*.lock
-  try {
-    for (const name of fs.readdirSync(gitDir)) {
-      if (name.endsWith(".lock")) candidates.push(path.join(gitDir, name));
-    }
-  } catch {
-    return; // no .git dir — nothing to do
-  }
-
-  // .git/refs/**\/*.lock — walk recursively. Typical repo has a
-  // handful of refs so this is cheap.
-  walkLocks(path.join(gitDir, "refs"), candidates);
-
-  const now = Date.now();
-  for (const lock of candidates) {
-    try {
-      const age = now - fs.statSync(lock).mtimeMs;
-      if (age <= maxAgeMs) continue; // looks live, leave it
-      fs.unlinkSync(lock);
-      console.warn(
-        `[gobog-sync] removed stale ${path.relative(dir, lock)} (${Math.round(age / 1000)}s old)`,
-      );
-    } catch (e) {
-      console.warn(`[gobog-sync] failed to clear ${lock}: ${e}`);
-    }
-  }
-}
-
-function walkLocks(dir: string, out: string[]): void {
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return; // dir missing (no refs/ yet on a fresh init), skip
-  }
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) walkLocks(full, out);
-    else if (entry.name.endsWith(".lock")) out.push(full);
   }
 }
 
@@ -142,13 +74,12 @@ export async function gitPull(
   remoteUrl: string,
   token: string,
 ): Promise<void> {
-  clearStaleGitLocks(dir);
-  const remote = withToken(remoteUrl, token);
+  const remote = remoteUrl;
 
   // Fetch the branch from the tokenised URL but never persist the token.
   // Use a one-shot fetch with the URL passed inline.
   try {
-    await git(["fetch", "--depth=50", remote, branch], dir);
+    await git(["fetch", "--depth=50", remote, `refs/heads/${branch}:refs/remotes/origin/${branch}`], dir, token);
   } catch (e) {
     // If the branch doesn't exist on the remote yet, that's not fatal —
     // the next push will create it. Otherwise rethrow.
@@ -181,7 +112,7 @@ export async function gitPull(
     throw new Error(
       "pull is not fast-forward — local commits diverge from origin/" +
         branch +
-        ". Resolve manually (git rebase / merge) before retrying.",
+        ". Resolve manually (git rebase / merge) before retrying. " + String(e),
     );
   }
 }
@@ -196,7 +127,6 @@ export async function gitPull(
  */
 export async function gitPushAll(dir: string, opts: PushOpts): Promise<void> {
   const diff = await gitStageAndDiff(dir, opts.authorName, opts.authorEmail);
-  if (diff === null) return; // nothing staged
   await gitCommitAndPush(dir, opts);
 }
 
@@ -213,7 +143,6 @@ export async function gitStageAndDiff(
   authorName: string,
   authorEmail: string,
 ): Promise<string | null> {
-  clearStaleGitLocks(dir);
   await git(["config", "user.name", authorName], dir);
   await git(["config", "user.email", authorEmail], dir);
   await git(["add", "-A"], dir);
@@ -231,22 +160,22 @@ export async function gitCommitAndPush(
   dir: string,
   opts: PushOpts,
 ): Promise<void> {
-  clearStaleGitLocks(dir);
   // Status check defends against a race where the diff was shown but the
   // user took long enough that another process committed. Cheap.
-  const status = await gitOut(["status", "--porcelain"], dir);
-  if (status.trim() === "") return;
-
-  await git(["commit", "-m", opts.commitMessage], dir);
-  const remote = withToken(opts.remoteUrl, opts.token);
-  await git(["push", remote, "HEAD:" + opts.branch], dir);
+  const branch = (await gitOut(["symbolic-ref", "--short", "HEAD"], dir)).trim();
+  if (branch !== opts.branch) throw new Error(`Current branch ${branch} differs from configured ${opts.branch}; switch branches before pushing.`);
+  const staged = await gitOut(["diff", "--cached", "--name-only"], dir);
+  if (staged.trim()) await git(["commit", "-m", opts.commitMessage], dir);
+  // A failed push may have left a clean tree with pending commits.
+  await git(["push", opts.remoteUrl, "HEAD:" + opts.branch], dir, opts.token);
+  const head = (await gitOut(["rev-parse", "HEAD"], dir)).trim();
+  await git(["update-ref", `refs/remotes/origin/${opts.branch}`, head], dir);
 }
 
 /** Unstage everything. Used when the user dismisses the diff modal —
  *  the working tree stays untouched so the next save resumes normally. */
 export async function gitResetStaged(dir: string): Promise<void> {
   if (!isGitRepo(dir)) return;
-  clearStaleGitLocks(dir);
   try {
     // `git reset` with no commit argument resets the index to HEAD,
     // leaving the working tree alone. On a brand-new repo (no HEAD yet)
@@ -259,7 +188,7 @@ export async function gitResetStaged(dir: string): Promise<void> {
 
 /** `git status --porcelain` reduced to a count + sample paths. */
 export async function gitStatusSummary(dir: string): Promise<StatusSummary> {
-  if (!isGitRepo(dir)) return { changedCount: 0, changedPaths: [] };
+  if (!isGitRepo(dir)) return { changedCount: 0, changedPaths: [], unpushedCommits: 0 };
   const out = await gitOut(["status", "--porcelain"], dir);
   const paths: string[] = [];
   for (const line of out.split("\n")) {
@@ -268,21 +197,32 @@ export async function gitStatusSummary(dir: string): Promise<StatusSummary> {
     // status lines look like " M path" or "?? path"; drop the 2-char prefix.
     paths.push(trimmed.slice(trimmed.indexOf(" ") + 1).trim());
   }
-  return { changedCount: paths.length, changedPaths: paths };
+  let unpushedCommits = 0;
+  try {
+    const branch = (await gitOut(["symbolic-ref", "--short", "HEAD"], dir)).trim();
+    const ref = `refs/remotes/origin/${branch}`;
+    const hasRemote = await gitOut(["rev-parse", "--verify", ref], dir).then(() => true, () => false);
+    unpushedCommits = Number((await gitOut(["rev-list", "--count", hasRemote ? `${ref}..HEAD` : "HEAD"], dir)).trim());
+  } catch { /* unborn repository */ }
+  return { changedCount: paths.length, changedPaths: paths, unpushedCommits };
 }
 
-/** Splice the GitHub PAT into an https URL just for one git invocation. */
-function withToken(httpsUrl: string, token: string): string {
-  if (!token) return httpsUrl;
-  return httpsUrl.replace(
-    /^https:\/\//,
-    `https://x-access-token:${encodeURIComponent(token)}@`,
-  );
+// Authentication stays in the child environment. Token URLs can leak into
+// .git/FETCH_HEAD, process arguments and error messages even without remote config.
+function gitEnv(token = ""): NodeJS.ProcessEnv {
+ const env: NodeJS.ProcessEnv = {...process.env, GIT_TERMINAL_PROMPT: "0"};
+ if (token) {
+  const count=Number(env.GIT_CONFIG_COUNT || "0");
+  env.GIT_CONFIG_COUNT=String(count+1);
+  env[`GIT_CONFIG_KEY_${count}`]="http.https://github.com/.extraheader";
+  env[`GIT_CONFIG_VALUE_${count}`]="AUTHORIZATION: basic "+Buffer.from(`x-access-token:${token}`).toString("base64");
+ }
+ return env;
 }
 
-function git(args: string[], cwd: string): Promise<void> {
+function git(args: string[], cwd: string, token = ""): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("git", args, { cwd, env: gitEnv(token), stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stdout.on("data", (b) => process.stdout.write(b));
     child.stderr.on("data", (b) => {
@@ -300,7 +240,7 @@ function git(args: string[], cwd: string): Promise<void> {
 
 function gitOut(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("git", args, { cwd, env: gitEnv(), stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (b) => (out += b.toString()));
     child.once("error", reject);

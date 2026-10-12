@@ -176,3 +176,9 @@ exactly the kind of thing a sync plugin shouldn't do.
 ## License
 
 MIT
+
+## 0.3 publishing fixes
+
+New posts default to `draft: true`; set `draft: false` when ready. Source sync includes drafts, so keep the source repository private. The renderer honors `publish: false` as well. Existing notes retain their state. Preview renders a temporary source copy, serves over loopback HTTP, and opens the permanent front-matter URL. Push retries pending commits even on a clean working tree, serializes sync operations, and leaves Git locks alone. External Git metadata via a `.git` pointer is supported for iCloud vaults. Deploy polling ignores runs older than the current push and falls back to anonymous reads for public sites.
+
+Run `npm ci`, `npm test`, and `npm run build`. Edit `src/`, then regenerate `main.js`.
