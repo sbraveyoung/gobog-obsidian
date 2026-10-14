@@ -4,11 +4,16 @@ import {createTimeWriter,TimeWriter} from './editor-time';import {mountPropertyV
 import {readProperties,patchProperties,publicationState} from './article-properties';import {ensureFrontMatter,generateId,FrontMatterDefaults} from './frontmatter';
 import {ReviewSnapshot} from './review';import {mountReviewView} from './review-view';import {getLatestDeploy,summarizeDeploy} from './deploy-status';
 import {DEFAULTS,GobogObsidianSettings,GobogSettingTab} from './settings';import {normalizeSourcePath,within} from './vault-path';import {isArticle,checkArticles} from './publish-check';
+import {scanImages,cleanImages,CleanupError,auditMarkdown,AssetAudit} from './asset-audit';
+import {mountAssetAuditView} from './asset-audit-view';
+import {GitHubSource} from './github-source';
+import {deviceRepoKey} from './mobile-sync';
+import {loadDeviceState,saveDeviceState} from './device-state';
 import {createMobileBackend} from './mobile-sync';import type {SyncBackend,SyncConfig} from './sync-types';import type {DesktopRuntime} from './desktop-runtime';
 export default class GobogObsidianPlugin extends Plugin {
  settings:GobogObsidianSettings={...DEFAULTS};syncBusy=false;private ready=false;previewOrigin='';timeWriter?:TimeWriter;
  private pushTimer:ReturnType<typeof setTimeout>|null=null;private statusEl:HTMLElement|null=null;
- private desktop?:DesktopRuntime;private desktopLoading?:Promise<DesktopRuntime>;private mobile?:SyncBackend;private mobileConfig='';private unloaded=false;
+ private desktop?:DesktopRuntime;private desktopLoading?:Promise<DesktopRuntime>;private mobile?:SyncBackend;private mobileConfig='';private unloaded=false;private auditController?:AbortController;
  async onload() {
     await this.loadSettings();
     this.timeWriter=createTimeWriter({enabled:()=>this.settings.autoUpdateTime,
@@ -23,6 +28,8 @@ export default class GobogObsidianPlugin extends Plugin {
     this.registerEditorExtension(EditorView.domEventHandlers({compositionend:(_e,view)=>{
       setTimeout(()=>{const file=view.state.field(editorInfoField,false)?.file;if(file){const text=view.state.doc.toString();this.timeWriter?.userEdit(file.path,text,text,false);}},0);return false;
     }}));
+    this.addCommand({id:'asset-audit',name:'扫描 blog 图片引用并生成清单',callback:()=>this.runAssetAudit().catch(e=>this.fail(e))});
+    this.addCommand({id:'asset-audit-cancel',name:'取消图片扫描',callback:()=>this.auditController?.abort()});
     this.addCommand({id:'article-properties',name:'编辑文章属性与发表状态',checkCallback:checking=>{
       const f=this.app.workspace.getActiveFile();if(!f||!this.isArticlePath(f.path))return false;
       if(!checking)this.editProperties(f).catch(e=>this.fail(e));return true;
@@ -251,6 +258,19 @@ fail(err: unknown) {
  private getMobile():SyncBackend{const config=this.syncConfig(),key=JSON.stringify([config,this.settings.blogFolder]);if(this.mobileConfig!==key){this.mobile?.dispose();this.mobile=createMobileBackend(this.app,config,this.settings.blogFolder);this.mobileConfig=key;}return this.mobile!;}
  syncConfig():SyncConfig{return{repoUrl:this.settings.repoUrl,branch:this.settings.branch,githubToken:this.settings.githubToken,authorName:this.settings.gitName||this.settings.defaultAuthor||'obsidian',authorEmail:this.settings.gitEmail||'obsidian@users.noreply.github.com'};}
  async beforePush(){const notes=[];for(const file of this.app.vault.getMarkdownFiles())if(this.isInsideBlogFolder(file.path))notes.push({path:this.relPathInBlog(file.path),text:await this.app.vault.read(file)});const errors=checkArticles(notes).filter(i=>i.level==='error');if(errors.length)throw new Error(errors.map(i=>i.path+': '+i.message).join('\n'));}
+ async runAssetAudit(){
+  if(this.auditController)throw new Error('图片扫描正在进行');this.auditController=new AbortController();const notice=new Notice('正在扫描图片引用…',0);
+  let audit:AssetAudit;try{const domains:string[]=[];if(this.settings.siteUrl)domains.push(new URL(this.settings.siteUrl).hostname.toLowerCase());const owner=this.settings.deployStatusRepo.split('/')[0];if(owner)domains.push(owner+'.github.io');
+   audit=await scanImages(this.app,this.settings.blogFolder,(done,total)=>{if(done%25===0||done===total)notice.setMessage(`扫描图片引用：${done}/${total}`);},this.auditController.signal,domains);
+  }finally{notice.hide();this.auditController=undefined;}
+  const exportReport=async()=>{const adapter=this.app.vault.adapter,base=this.app.vault.configDir+'/plugins/'+this.manifest.id+'/reports';if(!await adapter.exists(base))await adapter.mkdir(base);const name='unused-images-'+audit.createdAt.replace(/[:.]/g,'-');await adapter.write(base+'/'+name+'.md',auditMarkdown(audit));await adapter.write(base+'/'+name+'.json',JSON.stringify(audit,null,2));new Notice('图片清单已保存：'+base+'/'+name+'.md',14000);};
+  await exportReport();
+  new AssetModal(this.app,audit,()=>void exportReport().catch(e=>this.fail(e)),async paths=>{
+   this.requireRepoConfigured();const config=this.syncConfig(),remote=await new GitHubSource(config).readTree(),key=deviceRepoKey(this.app,config,this.settings.blogFolder),state=loadDeviceState(key);
+   const save=(items:typeof state.deletes)=>{for(const item of items){state.deletes=state.deletes.filter(d=>d.path!==item.path);state.deletes.push(item);}saveDeviceState(key,state);};
+   try{save(await cleanImages(this.app,audit,paths,remote.files));}catch(e){if(e instanceof CleanupError)save(e.completed);throw e;}
+  },path=>{const f=this.app.vault.getAbstractFileByPath(path);return f instanceof TFile?this.app.vault.getResourcePath(f):undefined;}).open();
+ }
  async runPull(){if(!Platform.isMobile)return(await this.getDesktop()).runPull();await this.exclusive(async()=>{this.requireRepoConfigured();await this.getMobile().pull();new Notice('手机 Pull 完成；本地改动与冲突内容保留');});}
  async runPush(){await this.timeWriter?.flush();if(!Platform.isMobile)return(await this.getDesktop()).runPush();await this.exclusive(async()=>{this.requireRepoConfigured();const started=new Date().toISOString(),backend=this.getMobile(),snapshot=await backend.prepare();if(!snapshot.changes.length){new Notice('没有待提交改动'+(snapshot.warnings.length?'\n'+snapshot.warnings.join('\n'):''),12000);return;}
  const message=renderCommitMessage(this.settings.commitTemplate,{changedCount:snapshot.changes.length,changedPaths:snapshot.changes.map(c=>c.path)});if(!await this.confirmReview(snapshot.review,message,async(file,full)=>snapshot.patches[file.path]?.[full?'full':'compact']||'')){new Notice('推送已取消');return;}const sha=await backend.publish(snapshot,message);new Notice('源码已提交 GitHub（'+sha.slice(0,7)+'）；网站部署另行进行。');if(this.settings.deployStatusEnabled)this.scheduleDeployStatusCheck(started);});}
@@ -260,7 +280,7 @@ fail(err: unknown) {
  async resetWeChatCache(){if(!Platform.isMobile)(await this.getDesktop()).resetWeChatCache();}
  async exclusive(fn:()=>Promise<void>){if(this.syncBusy)throw new Error('同步正在进行');this.syncBusy=true;try{await fn();}finally{this.syncBusy=false;this.setStatus('gobog: idle');}}
  confirmReview(review:ReviewSnapshot,message:string,load:Parameters<typeof mountReviewView>[3]):Promise<boolean>{return new Promise(resolve=>new DiffConfirmModal(this.app,review,message,load,resolve).open());}
- onunload(){this.unloaded=true;if(this.pushTimer)clearTimeout(this.pushTimer);if(this.deployStatusTimer)clearTimeout(this.deployStatusTimer);const writer=this.timeWriter;void writer?.flush().finally(()=>writer.dispose());this.mobile?.dispose();this.desktop?.dispose();}
+ onunload(){this.unloaded=true;this.auditController?.abort();if(this.pushTimer)clearTimeout(this.pushTimer);if(this.deployStatusTimer)clearTimeout(this.deployStatusTimer);const writer=this.timeWriter;void writer?.flush().finally(()=>writer.dispose());this.mobile?.dispose();this.desktop?.dispose();}
 }
 function nowStamp(): string {
   const d = new Date();
@@ -318,5 +338,12 @@ class PropertyModal extends Modal {
  private cleanup?:()=>void;
  constructor(app:App,private meta:Record<string,unknown>,private state:ReturnType<typeof publicationState>,private save:(values:Record<string,unknown>)=>Promise<void>){super(app);}
  onOpen(){this.cleanup=mountPropertyView(this.contentEl,this.meta,this.state,async values=>{await this.save(values);this.close();},()=>this.close());}
+ onClose(){this.cleanup?.();}
+}
+
+class AssetModal extends Modal {
+ private cleanup?:()=>void;
+ constructor(app:App,private audit:AssetAudit,private exportReport:()=>void,private clean:(paths:string[])=>Promise<void>,private preview:(path:string)=>string|undefined){super(app);}
+ onOpen(){this.cleanup=mountAssetAuditView(this.contentEl,this.audit,this.exportReport,this.clean,()=>this.close(),this.preview);}
  onClose(){this.cleanup?.();}
 }

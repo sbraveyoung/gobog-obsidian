@@ -23,13 +23,22 @@ export function resolveReference(app:App,source:string,link:string,files:TFile[]
 export async function scanImages(app:App,blogFolder:string,progress:(done:number,total:number)=>void,signal:AbortSignal,domains:string[]=[]):Promise<AssetAudit> {
  const blog=normalizeSourcePath(blogFolder),files=app.vault.getFiles().filter(f=>!f.path.split('/').some(p=>p.startsWith('.')));
  const images:AuditImage[]=files.filter(f=>within(f.path,blog)&&isImage(f.path)).map(f=>({path:f.path,bytes:f.stat.size,sha:'',state:'candidate',references:[],reasons:[]}));const indexed=new Map(images.map(i=>[i.path,i]));
- const sources=files.filter(f=>/\.(md|canvas|html?|css|svg|json|ya?ml|toml|txt)$/i.test(f.path));const errors:string[]=[];const start=new Map(files.map(f=>[f.path,`${f.stat.mtime}:${f.stat.size}`]));let done=0,cursor=0;
+ const sources=files.filter(f=>/\.(md|canvas|html?|css|svg|json|ya?ml|toml|txt|base)$/i.test(f.path));const errors:string[]=[];const start=new Map(files.map(f=>[f.path,`${f.stat.mtime}:${f.stat.size}`]));let done=0,cursor=0;
+ const hidden=new Set<string>(),adapter=app.vault.adapter;
+ async function addHidden(path:string){if(await adapter.exists(path))hidden.add(path);}
+ async function walkHidden(path:string){if(!await adapter.exists(path))return;const list=await adapter.list(path);for(const file of list.files)if(/\.(css|svg|json)$/i.test(file))hidden.add(file);for(const folder of list.folders)await walkHidden(folder);}
+ if(adapter&&typeof adapter.list==='function'){try{
+  await walkHidden(app.vault.configDir+'/snippets');await walkHidden(app.vault.configDir+'/themes');
+  for(const name of ['app.json','appearance.json','bookmarks.json','templates.json'])await addHidden(app.vault.configDir+'/'+name);
+  const plugins=app.vault.configDir+'/plugins';if(await adapter.exists(plugins))for(const folder of (await adapter.list(plugins)).folders)await addHidden(folder+'/data.json');
+ }catch(e){errors.push('无法读取 Obsidian 配置引用：'+String(e));}}
+ for(const path of hidden){const f=Object.assign(new TFile(),{path,extension:path.split('.').pop(),stat:{size:0,mtime:0}});sources.push(f);}
  const jobs=[...images.map(i=>({image:i,file:files.find(f=>f.path===i.path)!})),...sources.map(file=>({image:undefined,file}))];
  async function worker(){while(cursor<jobs.length){if(signal.aborted){errors.push('扫描已取消');return;}const job=jobs[cursor++];try{
   if(job.image)job.image.sha=await gitBlobSha(new Uint8Array(await app.vault.readBinary(job.file)));
   else{
    if(job.file.extension==='md'&&!app.metadataCache.getFileCache(job.file))throw new Error('链接缓存尚未就绪');
-   const text=await app.vault.read(job.file);for(const ref of extractReferences(job.file.path,text)) {
+   const text=hidden.has(job.file.path)?await adapter.read(job.file.path):await app.vault.read(job.file);for(const ref of extractReferences(job.file.path,text)) {
     const resolved=resolveReference(app,job.file.path,ref.link,files,blog,domains);
     for(const path of resolved.paths){const image=indexed.get(path);if(!image)continue;const evidence={source:job.file.path,target:path,evidence:ref.evidence};if(!image.references.some(x=>x.source===evidence.source&&x.evidence===evidence.evidence))image.references.push(evidence);
     if(resolved.ambiguous)image.reasons.push('同名/路径有歧义，保守保留');}

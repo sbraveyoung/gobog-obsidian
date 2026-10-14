@@ -22,7 +22,7 @@ export function mountReviewView(root: HTMLElement, review: ReviewSnapshot, messa
   const search=element(nav,"input","gobog-review-search");search.type="search";search.placeholder="搜索标题或路径";search.setAttribute("aria-label","搜索待推送文件");
   const list=element(nav,"div","gobog-review-file-list");
   const detail=element(workspace,"section","gobog-review-detail");detail.setAttribute("aria-label","文件改动");
-  const footer=element(root,"footer","gobog-review-footer");element(footer,"span","gobog-review-footnote","提交并推送全部已暂存文件；网站部署随后进行。");
+  const footer=element(root,"footer","gobog-review-footer");element(footer,"span","gobog-review-footnote","提交并推送本次审阅的改动；网站部署随后进行。");
   const cancelBtn=element(footer,"button","","取消");cancelBtn.type="button";cancelBtn.addEventListener("click",cancel);
   const confirmBtn=element(footer,"button","mod-cta","提交并推送");confirmBtn.type="button";confirmBtn.addEventListener("click",confirm);
   const buttons=new Map<ReviewFile,HTMLButtonElement>();

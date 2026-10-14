@@ -28,3 +28,7 @@ test('mobile retry reuses pending commit after an unknown response',async t=>{
  const f=gitApiFixture(t,{'post/a.md':base}),v=vaultFixture({'blog/post/a.md':base+'local'}),backend=createMobileBackend(v.app,f.config,'blog'),p=await backend.prepare();global.__gobogRequest=async args=>{if(args.method==='PATCH')throw Error('offline');return f.handler(args)};await assert.rejects(()=>backend.publish(p,'first'));
  global.__gobogRequest=f.handler;await backend.publish(await backend.prepare(),'retry');assert.equal(f.calls.filter(c=>c.method==='POST'&&c.route==='git/commits').length,1);
 });
+test('verified unchanged binary attachments are cached after first review',async t=>{
+ const f=gitApiFixture(t,{'post/a.md':base,'resource/image/a.png':'image'}),v=vaultFixture({'blog/post/a.md':base,'blog/resource/image/a.png':'image'}),backend=createMobileBackend(v.app,f.config,'blog');let imageReads=0;const read=v.app.vault.readBinary;v.app.vault.readBinary=async file=>{if(file.extension==='png')imageReads++;return read(file)};
+ await backend.prepare();const first=imageReads;await backend.prepare();assert.equal(imageReads,first);
+});

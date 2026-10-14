@@ -18,6 +18,11 @@ export function deviceRepoKey(app:App,config:SyncConfig,blog:string):string {
 export function createMobileBackend(app:App,config:SyncConfig,blogFolder:string):SyncBackend {
  const blog=normalizeSourcePath(blogFolder);if(!blog||blog!==blogFolder.trim().replace(/\/+$/,''))throw new Error('Blog 必须是库内有效子目录');
  const api=new GitHubSource(config),repoKey=deviceRepoKey(app,config,blog);let disposed=false;
+ const changed=new Map<string,number>(),refs:ReturnType<typeof app.vault.on>[]=[];
+ const invalidate=(file:{path:string})=>{changed.set(file.path,(changed.get(file.path)||0)+1);const state=loadDeviceState(repoKey);if(state.cache){delete state.cache[file.path];saveDeviceState(repoKey,state);}};
+ refs.push(app.vault.on('modify',invalidate),app.vault.on('create',invalidate),app.vault.on('delete',invalidate));
+ refs.push(app.vault.on('rename',(file,old)=>{invalidate(file);invalidate({path:old});}));
+
  const files=()=>app.vault.getFiles().filter(f=>within(f.path,blog)&&sourceContentPath(f.path.slice(blog.length+1)));
  const bytes=async(f:TFile)=>{const data=new Uint8Array(await app.vault.readBinary(f));if(data.length>MAX_MOBILE_BLOB)throw new Error(f.path+': 超过手机 20 MiB 限额');return data;};
  async function recover(){const state=loadDeviceState(repoKey);const received=state.pendingCommit?await api.received(state.pendingCommit):false;if(state.pendingCommit&&received){
@@ -35,11 +40,18 @@ export function createMobileBackend(app:App,config:SyncConfig,blogFolder:string)
 
  async function validate(snapshot:PreparedPush){if(disposed)throw new Error('插件已关闭');
   const current=files().map(f=>f.path).sort(),expected=Object.keys(snapshot.originals).filter(p=>within(p,blog)).sort();if(JSON.stringify(current)!==JSON.stringify(expected))throw new Error('blog 文件列表已改变，请刷新 diff');
-  for(const [path,sha]of Object.entries(snapshot.originals)){const file=app.vault.getAbstractFileByPath(path);if(!(file instanceof TFile)||await gitBlobSha(await bytes(file))!==sha)throw new Error(`${path}: 内容已改变，请刷新 diff`);}
+  const verifiedCache=loadDeviceState(repoKey).cache;
+  for(const [path,sha]of Object.entries(snapshot.originals)){const file=app.vault.getAbstractFileByPath(path);if(file instanceof TFile){const cache=verifiedCache?.[path],stat=snapshot.stats?.[path];if(!/\.(md|txt|json|ya?ml|toml|css|html?|js)$/i.test(path)&&!changed.has(path)&&cache?.sha===sha&&snapshot.remote.files[path.slice(blog.length+1)]===sha&&stat&&cache.mtime===file.stat.mtime&&cache.size===file.stat.size&&stat.mtime===file.stat.mtime&&stat.size===file.stat.size)continue;}
+   if(!(file instanceof TFile)||await gitBlobSha(await bytes(file))!==sha)throw new Error(`${path}: 内容已改变，请刷新 diff`);}
  }
  async function prepare():Promise<PreparedPush>{
-  const state=await recover(),remote=await api.readTree(),all=files(),local:Record<string,SourceFile>={},originals:Record<string,string>={},notes:Array<{path:string;text:string}>=[];let cursor=0;
-  await Promise.all(Array.from({length:Math.min(4,all.length)},async()=>{while(cursor<all.length){const file=all[cursor++],data=await bytes(file),sha=await gitBlobSha(data),rel=file.path.slice(blog.length+1);originals[file.path]=sha;local[rel]={path:rel,sha,bytes:sha===remote.files[rel]?new Uint8Array(0):data};if(file.extension==='md'){if(data.length>2*1024*1024)throw new Error(file.path+': 手机暂不支持审阅超过 2 MiB 的 Markdown');notes.push({path:rel,text:new TextDecoder().decode(data)});}}}));
+  const state=await recover(),remote=await api.readTree(),all=files(),local:Record<string,SourceFile>={},originals:Record<string,string>={},stats:Record<string,{mtime:number;size:number}>={},notes:Array<{path:string;text:string}>=[];let cursor=0;
+  await Promise.all(Array.from({length:Math.min(4,all.length)},async()=>{while(cursor<all.length){const file=all[cursor++],rel=file.path.slice(blog.length+1),stat={mtime:file.stat.mtime,size:file.stat.size},cache=state.cache?.[file.path],version=changed.get(file.path)||0;
+   stats[file.path]=stat;
+   if(!/\.(md|txt|json|ya?ml|toml|css|html?|js)$/i.test(file.path)&&!changed.has(file.path)&&cache?.mtime===stat.mtime&&cache.size===stat.size&&cache.sha===remote.files[rel]){originals[file.path]=cache.sha;local[rel]={path:rel,sha:cache.sha,bytes:new Uint8Array(0)};continue;}
+   const data=await bytes(file),sha=await gitBlobSha(data);
+   if(file.stat.mtime!==stat.mtime||file.stat.size!==stat.size||(changed.get(file.path)||0)!==version)throw new Error(file.path+': 准备期间文件已改变');
+   originals[file.path]=sha;if(!state.cache)state.cache={};state.cache[file.path]={...stat,sha};local[rel]={path:rel,sha,bytes:sha===remote.files[rel]?new Uint8Array(0):data};if(file.extension==='md'){if(data.length>2*1024*1024)throw new Error(file.path+': 手机暂不支持审阅超过 2 MiB 的 Markdown');notes.push({path:rel,text:new TextDecoder().decode(data)});}}}));
   const errors=checkArticles(notes).filter(i=>i.level==='error');if(errors.length)throw new Error(errors.map(i=>`${i.path} ${i.field}: ${i.message}`).join('\n'));
   const warnings=checkArticles(notes).filter(i=>i.level==='warning').map(i=>`${i.path}: ${i.message}`),changes:SyncChange[]=[],missing:string[]=[];
   for(const path of new Set([...Object.keys(local),...Object.keys(remote.files).filter(sourceContentPath)])){
@@ -65,7 +77,7 @@ export function createMobileBackend(app:App,config:SyncConfig,blogFolder:string)
    if(attachments.imported.some(i=>i.path===change.path))file.notices.push('从 blog 外导入附件；确认提交后才复制到 blog。');if(change.explicitDelete)file.notices.push('人工确认的清理删除；已保留回收站副本。');reviewFiles.push(file);
   }
   if(reviewFiles.length&&warnings.length)reviewFiles[0].notices.unshift(...warnings);
-  const result={remote,changes,review:{head:remote.head,tree:remote.tree,files:reviewFiles},patches,imported:attachments.imported,replacements:attachments.replacements,originals,warnings};await validate(result);saveDeviceState(repoKey,state);return result;
+  const result={remote,changes,review:{head:remote.head,tree:remote.tree,files:reviewFiles},patches,imported:attachments.imported,replacements:attachments.replacements,originals,stats,warnings};await validate(result);saveDeviceState(repoKey,state);return result;
  }
  async function ensureFolder(path:string){const parts=path.split('/').slice(0,-1);let folder='';for(const p of parts){folder=folder?folder+'/'+p:p;if(!app.vault.getAbstractFileByPath(folder))try{await app.vault.createFolder(folder)}catch(e){if(!app.vault.getAbstractFileByPath(folder))throw e;}}}
  async function writeFile(path:string,data:Uint8Array,expected?:string){const f=app.vault.getAbstractFileByPath(path);
@@ -98,6 +110,6 @@ export function createMobileBackend(app:App,config:SyncConfig,blogFolder:string)
    state.baseline={repoKey,head:remote.head,files:baseline};saveDeviceState(repoKey,state);
   },
   async status(){const p=await prepare();return `${p.changes.length} 个待提交文件${p.warnings.length?'；'+p.warnings.join('\n'):''}`;},
-  dispose(){disposed=true;}
+  dispose(){disposed=true;for(const ref of refs)app.vault.offref(ref);}
  };
 }

@@ -3,6 +3,7 @@ import type GobogObsidianPlugin from "./main";
 export interface GobogObsidianSettings {
   /** Path inside the vault (relative) that mirrors the blog repo. */
   blogFolder: string;
+  siteUrl: string;
 
   /** HTTPS URL of the blog markdown repo (e.g. https://github.com/sbraveyoung/blog.git). */
   repoUrl: string;
@@ -69,6 +70,7 @@ export interface GobogObsidianSettings {
 }
 export const DEFAULTS: GobogObsidianSettings = {
   blogFolder: "Blog",
+  siteUrl: "",
 
   repoUrl: "",
   branch: "master",
@@ -122,6 +124,7 @@ export class GobogSettingTab extends PluginSettingTab {
       this.plugin.settings.newPostDefaults=values;await this.plugin.saveSettings();}catch(e){new Notice('默认属性未保存：'+String(e));}
     }));
     containerEl.createEl("h2", { text: "Vault" });
+    new Setting(containerEl).setName('博客站点地址').setDesc('用于识别正文中的同站点绝对图片链接；例如 https://sbrave.cn。').addText(t=>t.setValue(this.plugin.settings.siteUrl).onChange(async v=>{try{if(v&&!/^https?:$/.test(new URL(v).protocol))throw new Error();this.plugin.settings.siteUrl=v;await this.plugin.saveSettings();}catch{new Notice('站点地址无效，未保存');}}));
 
     new Setting(containerEl)
       .setName("Blog folder")

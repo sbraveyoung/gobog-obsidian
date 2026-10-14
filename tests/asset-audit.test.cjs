@@ -18,3 +18,6 @@ test('explicit cleanup trashes only selected image and records version-bound int
  const {app,trash}=fixture();const a=await scanImages(app,'blog',()=>{},new AbortController().signal);const sha=a.images.find(x=>x.path.endsWith('unused.png')).sha;const result=await cleanImages(app,a,['blog/resource/image/unused.png'],{'resource/image/unused.png':sha});assert.deepEqual(trash,['blog/resource/image/unused.png']);assert.equal(result[0].remoteSha,sha);assert.equal(result[0].path,'resource/image/unused.png');
 });
 test('hash matches Git blob identity including UTF8 bytes',async()=>{assert.equal(await gitBlobSha(new TextEncoder().encode('hello\n')),'ce013625030ba8dba906f756967f9e9ca394464a');});
+test('Obsidian theme/snippet references prevent deleting a blog image',async()=>{
+ const {app}=fixture();app.vault.adapter={exists:async p=>p==='.obsidian/snippets',list:async()=>({files:['.obsidian/snippets/blog.css'],folders:[]}),read:async()=>'.hero { background: url("../../blog/resource/image/unused.png"); }'};const a=await scanImages(app,'blog',()=>{},new AbortController().signal);assert.equal(a.images.find(i=>i.path.endsWith('unused.png')).state,'referenced');
+});

@@ -9,6 +9,6 @@ export interface SyncChange { path:string;beforeSha?:string;after?:SourceFile;ex
 export interface PreparedPush {
  remote:RemoteTree;changes:SyncChange[];review:ReviewSnapshot;patches:Record<string,{compact:string;full:string}>;
  imported:SourceFile[];replacements:Record<string,{before:string;after:string}>;
- originals:Record<string,string>;warnings:string[];
+ originals:Record<string,string>;stats?:Record<string,{mtime:number;size:number}>;warnings:string[];
 }
 export interface SyncBackend {prepare():Promise<PreparedPush>;publish(snapshot:PreparedPush,message:string):Promise<string>;pull():Promise<void>;status():Promise<string>;dispose():void}
