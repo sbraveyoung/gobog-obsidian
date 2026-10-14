@@ -14,3 +14,11 @@ test('composition edits merge and wait until completed before flush',async()=>{
 test('invalid YAML is reported and preserved; disabled writer does nothing',async()=>{
  const {files,w,errors}=fixture();files['post/a.md']='---\nbad: [\n---\nbody';w.userEdit('post/a.md',header+'a',files['post/a.md'],false);await w.flush();assert.equal(errors.length,1);assert.match(files['post/a.md'],/bad: \[/);w.dispose();
 });
+test('compositionend stamps the accepted body even without a final document change',async()=>{
+ const {files,w}=fixture();const accepted=header+'输入法已确认';
+ w.userEdit('post/a.md',files['post/a.md'],accepted,true);files['post/a.md']=accepted;
+ await w.flush();assert.match(files['post/a.md'],/updated_time: old/);
+ w.userEdit('post/a.md',accepted,accepted,false);await w.flush();
+ assert.match(files['post/a.md'],/updated_time: "2026-10-14 12:00:00"/);
+ assert.match(files['post/a.md'],/create_time: old/);w.dispose();
+});
