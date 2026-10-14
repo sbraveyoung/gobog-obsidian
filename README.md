@@ -19,7 +19,7 @@ Desktop uses system Git. Mobile uses GitHub's Git Database API, uploading only c
 Build **outside your vault**, then package three runtime files:
 
 ```sh
-git clone https://github.com/sbraveyoung/gobog-obsidian.git /tmp/gobog-development
+git clone --branch 0.6.0 https://github.com/sbraveyoung/gobog-obsidian.git /tmp/gobog-development
 cd /tmp/gobog-development
 npm ci
 npm run build
