@@ -39,7 +39,7 @@ export function mountAssetAuditView(root: HTMLElement, audit: AssetAudit, export
         confirm.setAttribute('role', 'alertdialog');
         confirm.setAttribute('aria-label', '确认移入回收站');
         const bytes = audit.images.filter(i => selected.has(i.path)).reduce((n, i) => n + i.bytes, 0);
-        el('p', confirm, `确认将 ${selected.size} 张图片（${(bytes / 1048576).toFixed(2)} MiB）移入库外侧 .trash？清理前会再次检查引用。`);
+        el('p', confirm, `确认将 ${selected.size} 张图片（${(bytes / 1048576).toFixed(2)} MiB）移入库根目录的 .trash？清理前会再次检查引用。`);
         button(confirm, 'cancel-clean', '取消', () => confirm.remove());
         const yes = button(confirm, 'confirm-clean', '确认移入回收站', () => { yes.disabled = true; cleanButton.disabled = true; void clean([...selected]).then(() => { if (!disposed)
             status.textContent = '清理已完成，可从 .trash 恢复；Push 前仍需审阅删除。'; selected.clear(); confirm.remove(); render(); }).catch(e => { if (!disposed)
