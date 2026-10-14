@@ -24,3 +24,15 @@ export function extractReferences(source:string,text:string):LinkReference[] {
  for(const m of text.matchAll(/(?:[^\s"'<>`\[\](){}]+)\.(?:png|jpe?g|gif|svg|webp|avif|bmp|heic|ico|tiff?)(?:\?[^\s"'<>]*)?/gi))add(m[0],'文本中的资源路径',undefined,undefined,'text');
  return refs;
 }
+
+/** Fenced and inline code are retention evidence in audits, but never attachment edits. */
+export function markdownCodeRanges(text:string):Array<[number,number]>{
+ const ranges:Array<[number,number]>=[];let offset=0,fence:{char:string;length:number;start:number}|undefined;
+ for(const line of (text.match(/[^\n]*\n|[^\n]+$/g)||[])){const match=/^ {0,3}(`{3,}|~{3,})/.exec(line);
+  if(fence){if(match&&match[1][0]===fence.char&&match[1].length>=fence.length&&line.slice(match[0].length).trim()===''){ranges.push([fence.start,offset+line.length]);fence=undefined;}}
+  else if(match)fence={char:match[1][0],length:match[1].length,start:offset};
+  else{let pos=0;while(pos<line.length){const start=line.indexOf('`',pos);if(start<0)break;let count=1;while(line[start+count]==='`')count++;const marker='`'.repeat(count),end=line.indexOf(marker,start+count);if(end<0)break;ranges.push([offset+start,offset+end+count]);pos=end+count;}}
+  offset+=line.length;
+ }
+ if(fence)ranges.push([fence.start,text.length]);return ranges;
+}

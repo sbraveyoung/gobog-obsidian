@@ -1,0 +1,8 @@
+const {test}=require('node:test'),assert=require('node:assert/strict');const {vaultFixture}=require('./vault-fixture.cjs');const {planAttachments}=require('../.test-build/attachment-plan.cjs');const {createTextPatch}=require('../.test-build/text-patch.cjs');
+test('external photo examples inside code blocks are not imported or rewritten',async()=>{
+ const text='---\ncover: ""\n---\n```md\n![[example.png]]\n```\nInline `![[example.png]]`';const v=vaultFixture({'blog/post/a.md':text,'other/example.png':'image'});const plan=await planAttachments(v.app,'blog',[{path:'blog/post/a.md',text}]);assert.equal(plan.imported.length,0);assert.deepEqual(plan.replacements,{});
+});
+test('multi-level article imports preserve relative links and cover metadata',async()=>{
+ const text='---\ncover: ../outside/photo.png\ncustom: keep\n---\n![p](../../../outside/photo.png "title")';const v=vaultFixture({'blog/post/series/a.md':text,'outside/photo.png':'image'});const plan=await planAttachments(v.app,'blog',[{path:'blog/post/series/a.md',text}]);assert.equal(plan.imported.length,1);assert.match(plan.replacements['blog/post/series/a.md'].after,/!\[p\]\(\.\.\/\.\.\/resource\/image\//);assert.match(plan.replacements['blog/post/series/a.md'].after,/custom: keep/);
+});
+test('compact text diff reports separated hunks without merging unchanged middle text',()=>{const before=Array.from({length:20},(_,i)=>String(i)).join('\n')+'\n',after=before.replace('1\n','one\n').replace('18\n','eighteen\n');const patch=createTextPatch('post/a.md',before,after,false);assert.equal((patch.match(/^@@/gm)||[]).length,2);assert.match(patch,/\+one/);assert.match(patch,/\+eighteen/);});

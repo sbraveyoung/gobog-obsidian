@@ -43,7 +43,7 @@ export class GitHubSource {
   if(await this.readHead()!==parent)throw new Error('远端已改变，上次提交无法安全重试；请刷新审阅');
   try{await this.api('PATCH','/git/refs/heads/'+this.ref,{sha,force:false});return sha;}catch(e){if(e instanceof GitHubFailure&&e.status<500)throw e;try{if(await this.received(sha))return sha;}catch{}throw new UnknownPublication(sha);}
  }
- async commit(base:RemoteTree,changes:SyncChange[],message:string,beforeRef?:(sha:string)=>void):Promise<string>{
+ async commit(base:RemoteTree,changes:SyncChange[],message:string,beforeRef?:(sha:string)=>void|Promise<void>):Promise<string>{
   if(!this.config.githubToken)throw new Error('请设置具有源仓库 Contents 读写权限的 GitHub Token');
   if(await this.readHead()!==base.head)throw new Error('远端已改变，请刷新 diff 后重新提交');if(!changes.length)return base.head;
   const entries:Array<{path:string;mode:string;type:string;sha:string|null}>=[];const seen=new Set<string>();
@@ -57,7 +57,7 @@ export class GitHubSource {
   const tree=await this.api('POST','/git/trees',{base_tree:base.tree,tree:entries});if(!isSha(tree.sha))throw new Error('GitHub 新 tree 无效');
   const author=this.config.authorName&&this.config.authorEmail?{name:this.config.authorName,email:this.config.authorEmail}:undefined;
   const commit=await this.api('POST','/git/commits',{message,tree:tree.sha,parents:[base.head],...(author?{author}: {})});if(!isSha(commit.sha))throw new Error('GitHub 新 commit 无效');
-  beforeRef?.(commit.sha);if(await this.readHead()!==base.head)throw new Error('远端在提交前改变，请重新审阅');
+  await beforeRef?.(commit.sha);if(await this.readHead()!==base.head)throw new Error('远端在提交前改变，请重新审阅');
   try{await this.api('PATCH','/git/refs/heads/'+this.ref,{sha:commit.sha,force:false});}
   catch(e){if(e instanceof GitHubFailure&&e.status<500)throw e;try{if(await this.received(commit.sha))return commit.sha;}catch{/* preserve unknown outcome */}throw new UnknownPublication(commit.sha);}
   return commit.sha;
