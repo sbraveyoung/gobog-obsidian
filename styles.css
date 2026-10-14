@@ -79,3 +79,9 @@
 .gobog-properties input:not([type=checkbox]) { width: 100%; }
 .gobog-properties footer { position: sticky; bottom: 0; background: var(--background-primary); display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
 @media (max-width: 600px) { .gobog-properties label { grid-template-columns: 1fr; gap: 5px; } }
+.gobog-assets-list { max-height: 45vh; overflow: auto; margin: 12px 0; }
+.gobog-assets-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.gobog-assets-row button { flex: 1; height: auto; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.gobog-assets img { max-width: 100%; max-height: 240px; object-fit: contain; }
+.gobog-assets footer { display: flex; flex-wrap: wrap; gap: 8px; }
+.gobog-assets [role=alertdialog] { border: 1px solid var(--text-warning); padding: 12px; margin-top: 12px; }

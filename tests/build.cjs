@@ -1,6 +1,6 @@
-const esbuild=require('esbuild');
+const esbuild=require('esbuild'),fs=require('node:fs'),path=require('node:path');
+const apiPlugin={name:'obsidian-test-api',setup(build){build.onResolve({filter:/^obsidian$/},()=>({path:path.resolve('tests/obsidian-stub.cjs'),external:true}));}};
 (async()=>{
- for(const file of ['git','frontmatter','preview','review','review-view','editor-time','property-view']) await esbuild.build({entryPoints:[`src/${file}.ts`],bundle:true,platform:'node',format:'cjs',alias:{obsidian:'./tests/obsidian-stub.cjs'},external:['@codemirror/view','@codemirror/state'],outfile:`.test-build/${file}.cjs`});
- await esbuild.build({entryPoints:['src/deploy-status.ts'],bundle:true,platform:'node',format:'cjs',alias:{obsidian:'./tests/obsidian-stub.cjs'},external:['@codemirror/view','@codemirror/state'],outfile:'.test-build/deploy-status.cjs'});
- await esbuild.build({entryPoints:['src/main.ts'],bundle:true,platform:'node',format:'cjs',alias:{obsidian:'./tests/obsidian-stub.cjs'},external:['@codemirror/view','@codemirror/state'],outfile:'.test-build/plugin.cjs'});
+ for(const file of fs.readdirSync('src').filter(f=>f.endsWith('.ts')))await esbuild.build({entryPoints:[`src/${file}`],bundle:true,platform:'node',format:'cjs',plugins:[apiPlugin],external:['@codemirror/view','@codemirror/state'],outfile:`.test-build/${file.replace(/\.ts$/,'')}.cjs`});
+ fs.copyFileSync('.test-build/main.cjs','.test-build/plugin.cjs');
 })().catch(e=>{console.error(e);process.exitCode=1});

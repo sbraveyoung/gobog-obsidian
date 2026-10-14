@@ -1,0 +1,6 @@
+const {test}=require('node:test');const assert=require('node:assert/strict');const {parseHTML}=require('linkedom');let mountAssetAuditView;try{({mountAssetAuditView}=require('../.test-build/asset-audit-view.cjs'))}catch{}
+test('scan report never preselects images; deletion requires a second explicit confirmation',async()=>{
+ const {document}=parseHTML('<html><body><main></main></body></html>');const root=document.querySelector('main');let cleaned=[];const audit={complete:true,images:[{path:'blog/a.png',bytes:2048,state:'candidate',references:[],reasons:[],sha:'a'}],errors:[],createdAt:'now'};
+ mountAssetAuditView(root,audit,()=>{},async paths=>{cleaned=paths},()=>{},()=>undefined);
+ assert.equal(root.querySelector('[type="checkbox"]').checked,false);assert.equal(root.querySelector('[data-action="clean"]').disabled,true);root.querySelector('[type="checkbox"]').checked=true;root.querySelector('[type="checkbox"]').dispatchEvent(new document.defaultView.Event('change'));root.querySelector('[data-action="clean"]').click();assert.deepEqual(cleaned,[]);assert.ok(root.querySelector('[data-action="confirm-clean"]'));root.querySelector('[data-action="confirm-clean"]').click();await Promise.resolve();assert.deepEqual(cleaned,['blog/a.png']);
+});
