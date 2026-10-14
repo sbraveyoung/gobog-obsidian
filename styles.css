@@ -73,3 +73,9 @@
   .gobog-review-footnote { display: none; }
   .gobog-review-footer { justify-content: flex-end; }
 }
+
+.gobog-properties label { display: grid; grid-template-columns: minmax(9rem, 1fr) minmax(10rem, 2fr); gap: 12px; align-items: center; margin: 10px 0; }
+.gobog-properties textarea { min-height: 70px; width: 100%; }
+.gobog-properties input:not([type=checkbox]) { width: 100%; }
+.gobog-properties footer { position: sticky; bottom: 0; background: var(--background-primary); display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
+@media (max-width: 600px) { .gobog-properties label { grid-template-columns: 1fr; gap: 5px; } }

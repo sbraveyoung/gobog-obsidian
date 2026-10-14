@@ -1,5 +1,6 @@
 import {
   App,
+  editorInfoField,
   parseYaml,
   stringifyYaml,
   FileSystemAdapter,
@@ -12,6 +13,11 @@ import {
   TFile,
   TFolder,
 } from "obsidian";
+import { EditorView } from "@codemirror/view";
+import { Transaction } from "@codemirror/state";
+import { createTimeWriter, TimeWriter } from "./editor-time";
+import { mountPropertyView } from "./property-view";
+import { readProperties, patchProperties, publicationState } from "./article-properties";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
@@ -60,6 +66,8 @@ export interface GobogObsidianSettings {
   autoPushDebounceSec: number;
   /** Auto-fill front-matter on file create. */
   autoFrontMatter: boolean;
+  autoUpdateTime: boolean;
+  newPostDefaults: Record<string, unknown>;
 
   /** Commit message template. Supports {{date}}, {{count}}, {{paths}}. */
   commitTemplate: string;
@@ -115,6 +123,8 @@ const DEFAULTS: GobogObsidianSettings = {
   autoPushOnSave: false,
   autoPushDebounceSec: 30,
   autoFrontMatter: true,
+  autoUpdateTime: true,
+  newPostDefaults: {},
 
   commitTemplate: "obsidian sync: {{count}} file(s) at {{date}}",
 
@@ -146,8 +156,26 @@ export default class GobogObsidianPlugin extends Plugin {
   /** Status-bar element so the user can glance at sync state. */
   private statusEl: HTMLElement | null = null;
 
+  private timeWriter?: TimeWriter;
+
   async onload() {
     await this.loadSettings();
+    this.timeWriter=createTimeWriter({enabled:()=>this.settings.autoUpdateTime&&!this.syncBusy,
+      eligible:p=>this.isArticlePath(p),now:nowStamp,delayMs:1200,fail:e=>this.fail(e),
+      process:async(p,fn)=>{const f=this.app.vault.getAbstractFileByPath(p);if(f instanceof TFile)await this.app.vault.process(f,fn);}});
+    this.registerEditorExtension(EditorView.updateListener.of(update=>{
+      const info=update.state.field(editorInfoField,false),file=info?.file;
+      if(!file)return;
+      const user=update.transactions.some(t=>!t.annotation(Transaction.remote)&&['input','delete','move','undo','redo'].some(event=>t.isUserEvent(event)));
+      if(user&&update.docChanged)this.timeWriter?.userEdit(file.path,update.startState.doc.toString(),update.state.doc.toString(),update.view.composing);
+    }));
+    this.registerEditorExtension(EditorView.domEventHandlers({compositionend:(_e,view)=>{
+      setTimeout(()=>{const file=view.state.field(editorInfoField,false)?.file;if(file){const text=view.state.doc.toString();this.timeWriter?.userEdit(file.path,text,text,false);}},0);return false;
+    }}));
+    this.addCommand({id:'article-properties',name:'编辑文章属性与发表状态',checkCallback:checking=>{
+      const f=this.app.workspace.getActiveFile();if(!f||!this.isArticlePath(f.path))return false;
+      if(!checking)this.editProperties(f).catch(e=>this.fail(e));return true;
+    }});
 
     this.statusEl = this.addStatusBarItem();
     this.statusEl.setText("gobog: idle");
@@ -370,13 +398,26 @@ export default class GobogObsidianPlugin extends Plugin {
       url,
       create_time: nowStamp(),
       updated_time: nowStamp(),
-      ...(isNew ? { draft: true, publish: false, tags: [], description: "", category: "", hidden: false, private: false, pin: false, ai: false, cover: "" } : {}),
+      ...(isNew ? { tags: [], description: "", category: "", hidden: false, private: false, pin: false, ai: false, cover: "", ...this.settings.newPostDefaults, draft: true, publish: false } : {}),
     };
     const after = ensureFrontMatter(before, defaults);
     if (after !== before) {
       fs.writeFileSync(abs, after, "utf8");
       this.setStatus(`gobog: filled front matter on ${file.path}`);
     }
+  }
+
+  async editProperties(file:TFile) {
+    const before=await this.app.vault.read(file),meta=readProperties(before);const policies:Array<{path:string;hidden:boolean}>=[];
+    let folder=file.path.slice(0,file.path.lastIndexOf('/'));
+    while(this.isInsideBlogFolder(folder)) {
+      const p=folder+'/_folder.md',f=this.app.vault.getAbstractFileByPath(p);
+      if(f instanceof TFile){const values=readProperties(await this.app.vault.read(f));if(typeof values.hidden!=='boolean')throw new Error(p+': hidden must be true/false');policies.push({path:p,hidden:values.hidden});}
+      folder=folder.slice(0,folder.lastIndexOf('/'));if(!folder)break;
+    }
+    new PropertyModal(this.app,meta,publicationState(meta,policies),async values=>{
+      await this.app.vault.process(file,current=>{if(current!==before)throw new Error('文章已改变，请重新打开属性窗口');return patchProperties(current,values);});
+    }).open();
   }
 
   /** Vault-relative path → blog-folder-relative path. */
@@ -406,6 +447,7 @@ export default class GobogObsidianPlugin extends Plugin {
   async runPush() {
     if (this.syncBusy) throw new Error("A blog sync is already in progress.");
     this.syncBusy = true;
+    await this.timeWriter?.flush();
     const pushStartedAt = new Date().toISOString();
     try {
     this.requireRepoConfigured();
@@ -705,6 +747,7 @@ export default class GobogObsidianPlugin extends Plugin {
   }
 
   onunload() {
+    this.timeWriter?.dispose();
     if (this.pushTimer) clearTimeout(this.pushTimer);
     if (this.deployStatusTimer) clearTimeout(this.deployStatusTimer);
     this.previewServer?.close();
@@ -837,6 +880,12 @@ class GobogSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
+    new Setting(containerEl).setName('正文编辑时自动更新文章时间').setDesc('仅正文用户编辑更新 updated_time；同步和属性修改不更新。').addToggle(t=>t.setValue(this.plugin.settings.autoUpdateTime).onChange(async v=>{this.plugin.settings.autoUpdateTime=v;await this.plugin.saveSettings();}));
+    new Setting(containerEl).setName('新文章属性默认值').setDesc('JSON 对象；只作用于新文章，固定标识、URL、日期与草稿开关不可覆盖。').addTextArea(t=>t.setValue(JSON.stringify(this.plugin.settings.newPostDefaults,null,2)).onChange(async raw=>{
+      try{const values=JSON.parse(raw||'{}');const allowed=new Set(['author','description','category','tags','cover','order','pin','ai','hidden','private']);
+      if(!values||typeof values!=='object'||Array.isArray(values)||Object.keys(values).some(k=>!allowed.has(k)))throw new Error('请使用支持属性的 JSON 对象');
+      this.plugin.settings.newPostDefaults=values;await this.plugin.saveSettings();}catch(e){new Notice('默认属性未保存：'+String(e));}
+    }));
     containerEl.createEl("h2", { text: "Vault" });
 
     new Setting(containerEl)
@@ -1197,4 +1246,11 @@ class GobogSettingTab extends PluginSettingTab {
           }),
       );
   }
+}
+
+class PropertyModal extends Modal {
+ private cleanup?:()=>void;
+ constructor(app:App,private meta:Record<string,unknown>,private state:ReturnType<typeof publicationState>,private save:(values:Record<string,unknown>)=>Promise<void>){super(app);}
+ onOpen(){this.cleanup=mountPropertyView(this.contentEl,this.meta,this.state,async values=>{await this.save(values);this.close();},()=>this.close());}
+ onClose(){this.cleanup?.();}
 }
