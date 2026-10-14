@@ -10,7 +10,9 @@
  * persisted in the user's vault. Be conservative.
  */
 
-import { parseYaml } from "obsidian";
+import { readProperties, patchProperties } from "./article-properties";
+export { readProperties, patchProperties, articleBody, publicationState } from "./article-properties";
+export { checkArticles } from "./publish-check";
 
 export interface FrontMatterDefaults {
   title: string;
@@ -57,87 +59,12 @@ export function generateId(): string {
  * comments, custom properties and formatting remain intact.
  */
 export function ensureFrontMatter(body: string, defaults: FrontMatterDefaults): string {
-  const { existingBlock, rest, hasBlock } = splitFrontMatter(body);
-
-  const keys: (keyof FrontMatterDefaults)[] = [
-    "title",
-    "author",
-    "id",
-    "url",
-    "create_time",
-    "updated_time", "tags", "description", "category", "hidden", "private", "pin", "ai", "cover",
-  ];
-
-  if (!hasBlock) {
-    const lines = ["---"];
-    for (const k of keys) if (defaults[k] !== undefined) lines.push(`${k}: ${JSON.stringify(defaults[k])}`);
-    if (defaults.draft !== undefined) lines.push(`draft: ${defaults.draft}`);
-    if (defaults.publish !== undefined) lines.push(`publish: ${defaults.publish}`);
-    lines.push("---", "");
-    return lines.join("\n") + body;
+  const present=readProperties(body);
+  const missing:Record<string,unknown>={};
+  for(const [key,value] of Object.entries(defaults)) {
+    if(value===undefined || key in present) continue;
+    if((key==='draft'||key==='publish') && ('draft' in present||'publish' in present)) continue;
+    missing[key]=value;
   }
-
-  const present = parseKeys(existingBlock);
-  const missing: string[] = [];
-  for (const k of keys) {
-    if (!present.has(k) && defaults[k] !== undefined) missing.push(`${k}: ${JSON.stringify(defaults[k])}`);
-  }
-  if (defaults.draft !== undefined && !["draft", "publish"].some(k => present.has(k))) missing.push(`draft: ${defaults.draft}`);
-  if (defaults.publish !== undefined && !present.has("publish") && !present.has("draft")) missing.push(`publish: ${defaults.publish}`);
-  if (missing.length === 0) return body;
-
-  // Insert missing keys right before the closing `---`. Preserves the
-  // user's ordering of existing keys and any blank lines / comments.
-  const lines = existingBlock.split("\n");
-  // Last line of existingBlock is the closing `---`. Insert before it.
-  let endIdx = lines.length - 1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trim() === "---") {
-      endIdx = i;
-      break;
-    }
-  }
-  const newBlock = [...lines.slice(0, endIdx), ...missing, ...lines.slice(endIdx)].join("\n");
-  return newBlock + rest;
-}
-
-/**
- * Split `body` into the leading front-matter block (including delimiters)
- * and the rest. Returns hasBlock=false when the file doesn't start with
- * `---\n`.
- */
-function splitFrontMatter(body: string): {
-  existingBlock: string;
-  rest: string;
-  hasBlock: boolean;
-} {
-  if (!/^---[ \t]*\r?\n/.test(body)) {
-    return { existingBlock: "", rest: body, hasBlock: false };
-  }
-  // Find the closing `---` on its own line (allow trailing whitespace).
-  const lines = body.split("\n");
-  let closeIdx = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === "---") {
-      closeIdx = i;
-      break;
-    }
-  }
-  if (closeIdx === -1) {
-    throw new Error("Front matter has no closing ---; fix YAML before filling metadata.");
-  }
-  const blockLines = lines.slice(0, closeIdx + 1);
-  const restLines = lines.slice(closeIdx + 1);
-  return {
-    existingBlock: blockLines.join("\n"),
-    rest: (restLines.length > 0 ? "\n" : "") + restLines.join("\n"),
-    hasBlock: true,
-  };
-}
-
-function parseKeys(block: string): Set<string> {
-  const lines = block.split("\n");
-  const values = parseYaml(lines.slice(1, -1).join("\n")) ?? {};
-  if (typeof values !== "object" || Array.isArray(values)) throw new Error("Front matter must be a YAML mapping.");
-  return new Set(Object.keys(values));
+  return Object.keys(missing).length ? patchProperties(body,missing) : body;
 }
