@@ -28,6 +28,14 @@ node scripts/package-runtime.mjs /tmp/gobog-runtime
 
 Copy `main.js`, `manifest.json`, and `styles.css` to your vault's `.obsidian/plugins/gobog-obsidian`, preserving an existing `data.json`. Enable Gobog Sync in Community plugins. Do not install `node_modules`, source code or Git metadata in the vault; they create unnecessary synchronization work.
 
+## Install or upgrade on mobile with BRAT
+
+Install and enable the latest BRAT (1.1.0+) from Community plugins. In BRAT settings, choose **Add beta plugin**, enter `sbraveyoung/gobog-obsidian`, select release **0.6.0**, and add it. Enable Gobog Sync afterward. Release assets are downloaded directly into the current vault; retain existing `data.json` and do not uninstall Gobog first.
+
+0.6.0 is a prerelease pending real iOS publication acceptance. Desktop checks and mobile runtime/protocol tests pass; first review a mobile Push and cancel it before publishing. Installing plugin files does not repair delayed iCloud note synchronization.
+
+[BRAT developer guide](https://github.com/TfTHacker/obsidian42-brat/blob/main/BRAT-DEVELOPER-GUIDE.md)
+
 ## Configure and publish
 
 Set the blog folder, repository URL, branch, GitHub Token, author identity and optional site URL. Site URL allows the image audit to recognize same-site absolute links. New articles are drafts (`draft:true`, `publish:false`).

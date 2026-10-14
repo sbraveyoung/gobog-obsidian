@@ -20,6 +20,15 @@ node scripts/package-runtime.mjs /tmp/gobog-runtime
 
 只把 `main.js`、`manifest.json`、`styles.css` 放入库内 `.obsidian/plugins/gobog-obsidian`，保留已有 `data.json`。不要把开发源码、Git 元数据和 node_modules 放进 iCloud 库。然后在社区插件中启用 Gobog Sync。
 
+### 手机通过 BRAT 安装或升级
+
+在手机的社区插件市场安装并启用最新 BRAT（1.1.0+）。打开 BRAT 设置，选择 **Add beta plugin**，输入 `sbraveyoung/gobog-obsidian`，选择发布版本 **0.6.0** 并添加，然后在已安装插件中启用 Gobog Sync。BRAT 从 GitHub Release 下载运行文件，不依赖 iCloud 更新隐藏的 `.obsidian` 目录；保留已有 `data.json`，不要先卸载 Gobog。
+
+0.6.0 当前作为预发布版本交付：桌面与无 Node 手机运行时测试已通过，真实 iOS 发布仍待验收。首次手机 Push 应先审阅并取消，确认库目录、仓库和分支正确后再正式提交。插件下载安装与文章的 iCloud 同步是两件事；若手机尚未收到最新笔记，仍需要检查源库同步。
+
+BRAT 官方说明：https://github.com/TfTHacker/obsidian42-brat/blob/main/BRAT-DEVELOPER-GUIDE.md
+
+
 ## 日常发布
 
 配置 blog 目录、仓库 URL、分支、Token、作者身份；站点地址用于识别同站点的绝对图片链接。
