@@ -77,47 +77,7 @@ export async function gitPull(
   remoteUrl: string,
   token: string,
 ): Promise<void> {
-  const remote = remoteUrl;
-
-  // Fetch the branch from the tokenised URL but never persist the token.
-  // Use a one-shot fetch with the URL passed inline.
-  try {
-    await git(["fetch", "--depth=50", remote, `refs/heads/${branch}:refs/remotes/origin/${branch}`], dir, token);
-  } catch (e) {
-    // If the branch doesn't exist on the remote yet, that's not fatal —
-    // the next push will create it. Otherwise rethrow.
-    const msg = String(e);
-    if (!/couldn't find remote ref|does not exist|not our ref/i.test(msg)) {
-      throw e;
-    }
-    return;
-  }
-
-  // Ensure local branch exists; if not, point it at FETCH_HEAD.
-  const branches = await gitOut(["branch", "--list", branch], dir);
-  if (branches.trim() === "") {
-    // No local branch yet — create one from FETCH_HEAD.
-    await git(["checkout", "-b", branch, "FETCH_HEAD"], dir);
-    return;
-  }
-
-  // We're on the right branch already? If not, switch.
-  const cur = (await gitOut(["rev-parse", "--abbrev-ref", "HEAD"], dir)).trim();
-  if (cur !== branch) {
-    await git(["checkout", branch], dir);
-  }
-
-  // Fast-forward merge from FETCH_HEAD. If FF isn't possible, we abort
-  // rather than rebasing — the user gets a Notice and can resolve.
-  try {
-    await git(["merge", "--ff-only", "FETCH_HEAD"], dir);
-  } catch (e) {
-    throw new Error(
-      "pull is not fast-forward — local commits diverge from origin/" +
-        branch +
-        ". Resolve manually (git rebase / merge) before retrying. " + String(e),
-    );
-  }
+  await reconcileIncoming(dir, branch, remoteUrl, token);
 }
 
 /**
@@ -170,6 +130,7 @@ export async function gitCommitAndPush(
   if (opts.reviewTree && (await gitOut(["write-tree"], dir)).trim() !== opts.reviewTree) {
     throw new Error("The staged changes changed after review. 请重新检查差异后推送。");
   }
+  if(opts.reviewTree){const unstaged=await gitOut(['diff','--name-only','-z'],dir),untracked=await gitOut(['ls-files','--others','--exclude-standard','-z'],dir);if(unstaged||untracked)throw new Error('Working files changed after review. 请重新检查差异后推送。');}
   const staged = await gitOut(["diff", "--cached", "--name-only"], dir);
   if (staged.trim()) await git(["commit", "-m", opts.commitMessage], dir);
   // A failed push may have left a clean tree with pending commits.
@@ -302,4 +263,38 @@ export async function gitStageForReview(dir: string, authorName: string, authorE
 
 export async function gitReviewPatch(dir:string,review:ReviewSnapshot,file:ReviewFile,fullContext=false):Promise<string> {
   return gitOut(["--literal-pathspecs","-c","core.quotePath=false","diff","--no-color","--no-ext-diff","--no-textconv",fullContext ? "--unified=1000000" : "--unified=3",review.head,review.tree,"--",file.oldPath || file.path,...(file.oldPath ? [file.path] : [])],dir);
+}
+
+export interface IndexSnapshot {head:string;tree:string;data?:Uint8Array}
+async function indexPath(dir:string):Promise<string>{const p=(await gitOut(['rev-parse','--git-path','index'],dir)).trim();return path.isAbsolute(p)?p:path.join(dir,p);}
+export async function captureIndex(dir:string):Promise<IndexSnapshot>{
+ const head=await gitOut(['rev-parse','--verify','HEAD'],dir).then(x=>x.trim(),()=>''),tree=(await gitOut(['write-tree'],dir)).trim(),p=await indexPath(dir);
+ return {head,tree,data:fs.existsSync(p)?fs.readFileSync(p):undefined};
+}
+export async function restoreIndex(dir:string,snapshot:IndexSnapshot,expectedTree?:string):Promise<void>{
+ const head=await gitOut(['rev-parse','--verify','HEAD'],dir).then(x=>x.trim(),()=>''),tree=(await gitOut(['write-tree'],dir)).trim();
+ if(head!==snapshot.head||expectedTree&&tree!==expectedTree)throw new Error('HEAD/index changed externally; original staging was not overwritten.');
+ const p=await indexPath(dir),lock=p+'.lock';let owned=false;
+ try{fs.writeFileSync(lock,snapshot.data||new Uint8Array(),{flag:'wx'});owned=true;if(snapshot.data)fs.renameSync(lock,p);else{fs.rmSync(p,{force:true});fs.rmSync(lock);}}finally{if(owned&&fs.existsSync(lock))fs.rmSync(lock);}
+}
+/** Coordinate content already mirrored through iCloud without discarding other local edits. */
+export async function reconcileIncoming(dir:string,branch:string,remoteUrl:string,token:string):Promise<void>{
+ const current=(await gitOut(['symbolic-ref','--short','HEAD'],dir)).trim();if(current!==branch)throw new Error('Configured branch differs from current branch');
+ try{await git(['fetch','--depth=50',remoteUrl,`refs/heads/${branch}:refs/remotes/origin/${branch}`],dir,token);}catch(e){if(/couldn't find remote ref|does not exist|not our ref/i.test(String(e)))return;throw e;}
+ const incoming=(await gitOut(['rev-parse',`refs/remotes/origin/${branch}`],dir)).trim(),head=await gitOut(['rev-parse','--verify','HEAD'],dir).then(x=>x.trim(),()=> '');
+ if(!head){await git(['read-tree',incoming],dir);await git(['update-ref','refs/heads/'+branch,incoming],dir);const tracked=(await gitOut(['ls-tree','-r','--name-only','-z',incoming],dir)).split('\0').filter(Boolean);for(const p of tracked)if(!fs.existsSync(path.join(dir,p)))await git(['--literal-pathspecs','checkout-index','--',p],dir);return;}
+ if(head===incoming)return;
+ if(await git(['merge-base','--is-ancestor',incoming,head],dir).then(()=>true,()=>false))return;
+ if(!await git(['merge-base','--is-ancestor',head,incoming],dir).then(()=>true,()=>false))throw new Error('Local commits diverge from remote; resolve conflict before syncing.');
+ const saved=await captureIndex(dir);let stagedTree=saved.tree;
+ const objectAt=(ref:string,p:string)=>gitOut(['rev-parse',`${ref}:${p}`],dir).then(x=>x.trim(),()=>undefined);
+ try{
+  const changes=(await gitOut(['diff','--name-only','-z',head,incoming],dir)).split('\0').filter(Boolean);
+  for(const p of changes){const target=await objectAt(incoming,p),old=await objectAt(head,p),staged=await objectAt(saved.tree,p),absolute=path.join(dir,p);
+   if(staged!==old&&staged!==target)throw new Error(p+': existing staged edit overlaps incoming content');
+   let matches=false;if(!target)matches=!fs.existsSync(absolute);else if(fs.existsSync(absolute)&&fs.lstatSync(absolute).isFile())matches=(await gitOut(['hash-object','--no-filters','--',p],dir)).trim()===target;
+   if(matches){await git(['--literal-pathspecs','add','-A','--',p],dir);stagedTree=(await gitOut(['write-tree'],dir)).trim();}
+  }
+  stagedTree=(await gitOut(['write-tree'],dir)).trim();await git(['merge','--ff-only',incoming],dir);
+ }catch(e){await restoreIndex(dir,saved,stagedTree).catch(error=>{throw new Error(String(e)+'; '+String(error));});throw new Error('Cannot fast-forward safely; local contents and staging preserved. '+String(e));}
 }
