@@ -1,113 +1,55 @@
 # Gobog Sync
 
-[English](./README.md) | **[简体中文](./README.zh-CN.md)**
+[English](./README.md) | **简体中文**
 
-Obsidian 插件：把 vault 里的某个文件夹和一个 GitHub markdown 仓库做双向同步，
-并在新建文件时自动填好 front matter。
-
-这是 [`gobog`](https://github.com/sbraveyoung/gobog) 在写作侧的配套插件。
-整套架构一张图：
-
-```
-Obsidian vault              GitHub 仓库                 GitHub Pages
-─────────────────  ◄────►   ───────────────  ─────►    ───────────────
-   Blog/                    sbraveyoung/blog            sbraveyoung.github.io
-     post/                  （markdown 原始内容）       （渲染好的 HTML）
-     pages/                       │
-     resource/image/              │ workflow_dispatch
-                                  ▼
-                          sbraveyoung/gobog（渲染引擎）
-                          构建并把 HTML commit 回 github.io
-```
-
-插件做的事：
-
-- **Pull**：把 blog 仓库拉到本地 vault 文件夹（让你本地的 Obsidian
-  跟 GitHub 保持一致——异地写作、灾备都靠它）。
-- **Push**：把本地改动 commit + push 回仓库（写完不用切到终端）。
-- **Front matter 自动填充**：在 blog 文件夹下新建 `.md` 文件时，
-  插件会自动把 `title`、`author`、`id`、`url`、`create_time`、
-  `updated_time` 几个字段补齐。**永远不会覆盖你已经写好的字段**——
-  只补缺失的。
-- **推送到微信公众号草稿（可选）**：把当前笔记作为**草稿**推到
-  公众号后台。插件**永远不会自动发布**——你需要登录
-  mp.weixin.qq.com 在草稿箱里预览、确认、点发布。插件会自动把
-  文章里的本地图片上传成永久素材、把图片 URL 替换成微信 CDN 链接、
-  内联 CSS（公众号会剥掉 `<style>` 块），然后调用
-  `/cgi-bin/draft/add` 创建草稿。默认关闭，需要时在设置里启用。
-
-插件**不做**的事：
-
-- 不渲染、不发布 HTML——那是 github.io 仓库的 GitHub Actions 的职责。
-- 不绑定 git，直接调用系统 `PATH` 里的 `git`。
-- 不支持移动端（依赖 Electron）。
-
-## 环境要求
-
-- Obsidian 1.4+（只支持桌面端）。
-- 系统 `PATH` 下有 `git`。
-- 一个 GitHub 上的 markdown 源仓库（比如 `sbraveyoung/blog`），
-  以及一个对它有 `Contents: Read & Write` 权限的 Personal Access Token。
+在 Obsidian 写 Markdown，审阅改动文件后提交 GitHub，由现有 Notify → Gobog → GitHub Pages 管线生成博客。0.6.0 支持桌面和手机；手机直接调用 GitHub API，Mac 不必开机。
 
 ## 安装
 
-社区市场暂未发布，手动装：
+要求 Obsidian 1.5.7+，建议更新至当前版本。桌面需要系统 Git；手机需要 Web Crypto 和既有 GitHub 源仓库、分支，以及该仓库 Contents 读写权限的 Token。
+
+在库外构建：
 
 ```sh
-git clone https://github.com/sbraveyoung/gobog-obsidian.git \
-  <你的-vault>/.obsidian/plugins/gobog-obsidian
-cd <你的-vault>/.obsidian/plugins/gobog-obsidian
-npm install
+git clone https://github.com/sbraveyoung/gobog-obsidian.git /tmp/gobog-development
+cd /tmp/gobog-development
+npm ci
 npm run build
+node scripts/package-runtime.mjs /tmp/gobog-runtime
 ```
 
-然后在 Obsidian 里：设置 → 第三方插件 → 启用 "Gobog Sync"。
+只把 `main.js`、`manifest.json`、`styles.css` 放入库内 `.obsidian/plugins/gobog-obsidian`，保留已有 `data.json`。不要把开发源码、Git 元数据和 node_modules 放进 iCloud 库。然后在社区插件中启用 Gobog Sync。
 
-## 配置
+## 日常发布
 
-设置 → Gobog Sync。
+配置 blog 目录、仓库 URL、分支、Token、作者身份；站点地址用于识别同站点的绝对图片链接。
 
-| 分组         | 字段                          | 说明 |
-| ------------ | ----------------------------- | --- |
-| Vault        | 博客文件夹                    | Vault 里要镜像到博客仓库的子目录（比如 `Blog`）。 |
-| Git remote   | Repository URL                | `https://github.com/<owner>/<repo>.git` |
-|              | 分支                          | 现有 blog 仓库是 `master`。 |
-|              | GitHub token                  | Fine-grained PAT（Contents: Read & Write）。本地存储。 |
-|              | Git 作者名 / 邮箱             | 插件提交时使用的 identity。 |
-| 同步行为      | 启动时 pull                   | Obsidian 打开 vault 时自动 fast-forward。默认开启。 |
-|              | 保存时自动 push               | 每次保存后自动 commit + push（防抖）。默认关闭。 |
-|              | 自动 push 防抖（秒）          | 静默多少秒后才真正推送。默认 30。 |
-|              | Commit 消息模板               | 支持 `{{date}}`、`{{count}}`、`{{paths}}`。 |
-| Front matter | 新建时自动填充                | 新建 `.md` 时插入 YAML 块。 |
-|              | 默认作者                      | 写入 `author:` 字段。 |
-|              | URL 模板                      | 文章用；`{{id}}` 会被自动生成的 id 替换。 |
+1. 在 `blog/post/` 或 `blog/pages/` 的直接子文件中写作；新文章默认草稿。
+2. 执行 **编辑文章属性与发表状态**，管理标题、摘要、分类、标签、封面、章节顺序 `order`、置顶和 AI 标记。“准备发表”协调 draft/publish，不绕过 hidden/private 或父目录限制。
+3. 执行 **Push blog repo**，审阅文件列表、属性表和正文差异，确认整批改动后提交。选择某个文件只改变查看对象，不改变上传范围。
+4. 源码提交与网站部署是不同阶段，以成功部署及页面可访问为发表完成。
 
-## 命令
+手机不在启动或保存时自动联网/扫描，即使桌面自动同步设置已开启。首次手机比较没有设备基线，必须仔细审阅两份当前内容；随后可识别本地改动、远端更新和同文件冲突。手机缺失的文件可能尚未下载，不推断远端删除。手动 Pull 保留本地修改和冲突内容。
 
-命令面板里：
+文章引用库内但 blog 外的图片时，窗口会展示资源导入及链接改写；确认提交后才复制，使用内容哈希资源名防止重名覆盖。手机单附件上限 20 MiB、Markdown 审阅上限 2 MiB，超限请用桌面。已校验且未变化的二进制附件使用设备本地哈希缓存，文件事件/元数据变化会失效；缓存及比较基线不进入仓库。
 
-- **Gobog Sync: Pull blog repo** — fetch + fast-forward。
-- **Gobog Sync: Push blog repo** — commit 本地改动 + push。
-- **Gobog Sync: Show sync status** — 提示"干净 / 有 N 个文件改动"。
-- **Gobog Sync: Fill front matter for the active file** — 手动重跑一次
-  自动填充（适合给"插件装好之前就存在"的旧文件补字段）。
-- **Gobog Sync: Preview blog locally** — 调用本地 gobog 二进制把
-  blog 文件夹渲染一遍，然后在默认浏览器里打开结果。当前如果开着一篇
-  文章，会直接跳到那一篇的预览页面。需要在设置里配置 `gobog binary path`。
-- **Gobog Sync: Push active post to WeChat (公众号) as draft** —
-  把当前文章作为草稿推送到微信公众号。只有在设置里启用 WeChat 推送
-  后才会出现。
+桌面会协调手机提交后已由 iCloud 同步到本机的内容，保留其他草稿和已有暂存。取消 Push 恢复先前暂存；审阅后文件或索引改变会停止旧快照提交。同文件冲突或分叉不会 force push/reset。
 
-## 提交前的 Diff 确认
+## 自动更新时间与属性检查
 
-默认每次 push（手动 / 自动都包括）都会先弹一个 modal 显示
-`git diff --cached` 和将要使用的 commit 信息。**Commit & Push** 继续，
-**Cancel** 把暂存区清空、本次 push 中止（工作目录不动，下次保存照常
-继续）。大 diff 在 modal 里滚动；过大的 diff 会截断并提示用
-`git diff --cached` 看完整版本，避免 Obsidian 卡顿。
+启用 **正文编辑时自动更新文章时间** 后，正文的真实用户编辑会防抖更新 `updated_time`；中文输入完成后再处理。只改属性、打开、重命名、Git Pull 和 iCloud 同步不更新时间，`create_time` 保持不变。需要维护历史日期时可以关闭此设置。Push 前完成待写入的时间，再捕获审阅快照。
 
-不想每次都确认的话，去
-**设置 → Gobog Sync → Confirm diff before each push** 关掉。
+固定 id/url、未知属性、注释及正文不自动重写。新文章默认值仅作用于新文章，不能把新文自动变成已发表。发布前检查 YAML、重复 id/url、危险路径、章节顺序及目录控制；兼容的历史格式给出提示，不悄悄改值。沿用现有日期格式和渲染器历史时区解释，本次不迁移旧日期。
+
+## 图片扫描与人工清理
+
+执行 **扫描 blog 图片引用并生成清单**。检查整个库的笔记（包含草稿、隐藏和私有文章）、Canvas、cover 属性、Markdown/wiki/HTML/srcset/CSS，以及主题、片段和插件配置中的图片引用。扫描只判断当前引用，不证明历史上从未用过。
+
+清单分为 **被引用／疑似未引用／无法确认**，展示路径、大小、引用来源，支持搜索、按大小排序及按需预览。Markdown/JSON 保存在插件 `reports/` 目录，位于 blog 外，不参与 Push。扫描不完整或期间文件变化时，禁止清理；**取消图片扫描** 可以中止。
+
+不会默认勾选或自动删除。人工选中候选后还有一次确认，清理前重新检查引用、内容和远端版本，再移入库根目录 `.trash`。可从回收站恢复。手机清理会记录版本绑定的删除意图，随后 Push 仍需审阅删除；恢复图片会撤销对应意图。删除当前文件不会清除 Git 历史，因此完整 clone 的体积不会立即按清单大小减少。
+
+本地 Gobog 主题预览和微信公众号草稿推送继续在桌面使用；预览输出放在库外临时目录，不参与 iCloud 同步。手机使用 Obsidian 阅读预览，最终主题效果以 CI 部署为准。
 
 ## 微信公众号推送（可选）
 

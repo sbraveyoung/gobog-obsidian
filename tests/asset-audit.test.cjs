@@ -21,3 +21,7 @@ test('hash matches Git blob identity including UTF8 bytes',async()=>{assert.equa
 test('Obsidian theme/snippet references prevent deleting a blog image',async()=>{
  const {app}=fixture();app.vault.adapter={exists:async p=>p==='.obsidian/snippets',list:async()=>({files:['.obsidian/snippets/blog.css'],folders:[]}),read:async()=>'.hero { background: url("../../blog/resource/image/unused.png"); }'};const a=await scanImages(app,'blog',()=>{},new AbortController().signal);assert.equal(a.images.find(i=>i.path.endsWith('unused.png')).state,'referenced');
 });
+test('reference changes during the final image read stop confirmed cleanup',async()=>{
+ const {app,data,trash}=fixture(),audit=await scanImages(app,'blog',()=>{},new AbortController().signal);const listeners=[];app.vault.on=(_event,cb)=>{listeners.push(cb);return{}};app.vault.offref=()=>{};let reads=0;const original=app.vault.readBinary;app.vault.readBinary=async f=>{const result=await original(f);if(++reads>audit.images.length){data.set('outside.md','![[unused.png]]');for(const cb of listeners)cb({path:'outside.md'});}return result;};
+ await assert.rejects(()=>cleanImages(app,audit,['blog/resource/image/unused.png'],{'resource/image/unused.png':audit.images.find(i=>i.path.endsWith('unused.png')).sha}));assert.deepEqual(trash,[]);
+});

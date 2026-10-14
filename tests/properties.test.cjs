@@ -25,3 +25,6 @@ test('duplicate permanent routes and unsafe URLs stop publishing; legacy boolean
 test('folder policy rejects nonboolean hidden; ordered series metadata stays valid',()=>{
  const issues=checkArticles([{path:'post/_folder.md',text:'---\nhidden: yes\n---\n'}, {path:'post/a.md',text:'---\nid: a\nurl: /a\norder: 2\ntags: [go]\ncreate_time: "2026-10-14 12:00:00"\n---\nbody'}]);assert.equal(issues.filter(x=>x.level==='error').length,1);
 });
+test('minified production YAML does not bypass alias safety checks',()=>{
+ const output=require('esbuild').buildSync({entryPoints:['src/frontmatter.ts'],bundle:true,minify:true,platform:'browser',format:'cjs',write:false}).outputFiles[0].text;const module={exports:{}};require('node:vm').runInNewContext(output,{module,exports:module.exports,crypto:globalThis.crypto});assert.throws(()=>module.exports.patchProperties('---\nclock: &clock old\nupdated_time: *clock\n---\nbody',{updated_time:'new'}));
+});

@@ -2,116 +2,62 @@
 
 **[English](./README.md)** | [简体中文](./README.zh-CN.md)
 
-Obsidian plugin: keeps a folder of your vault in sync with a GitHub markdown
-repo, two-way, and auto-fills front matter on new notes.
+Write Markdown in Obsidian, review changed files, and publish through your GitHub source repository and existing Gobog/Pages workflow. Version 0.6 supports desktop and mobile.
 
-This is the editing-side companion to [`gobog`](https://github.com/sbraveyoung/gobog).
-Architecture in one picture:
-
-```
-Obsidian vault              GitHub repo                 GitHub Pages
-─────────────────  ◄────►   ───────────────  ─────►    ───────────────
-   Blog/                    sbraveyoung/blog            sbraveyoung.github.io
-     post/                  (markdown source)           (rendered HTML)
-     pages/                       │
-     resource/image/              │ workflow_dispatch
-                                  ▼
-                          sbraveyoung/gobog (renderer)
-                          builds + commits HTML to github.io
+```text
+Obsidian blog → reviewed source commit → Notify → Gobog render → GitHub Pages
 ```
 
-What this plugin does:
+Desktop uses system Git. Mobile uses GitHub's Git Database API, uploading only changed blobs and atomically advancing the configured branch without a force update. Your Mac does not need to be running. Public visibility remains controlled by article properties and ancestor `_folder.md` policies.
 
-- **Pull** the blog repo into your vault folder (so your local Obsidian
-  matches GitHub — covers writing-from-another-machine and disaster
-  recovery).
-- **Push** local changes back to the repo (so writing in Obsidian also
-  updates the source-of-truth).
-- **Front-matter auto-fill**: when a new `.md` is created inside the blog
-  folder, the plugin prepends a YAML block with `title`, `author`, `id`,
-  `url`, `create_time`, `updated_time`. Existing front-matter is never
-  overwritten — only the missing keys are added.
-- **Push to WeChat 公众号 (optional)**: submits the active note as a
-  *draft* to the WeChat MP draft box. Drafts are never auto-published —
-  you log into mp.weixin.qq.com, preview, and click 发布. The plugin
-  uploads embedded images as permanent material, rewrites their URLs in
-  the article, inlines CSS so WeChat's HTML sanitizer keeps the styling,
-  and creates the draft via `/cgi-bin/draft/add`. Off by default —
-  enable in settings if you want it.
+## Requirements and install
 
-What this plugin doesn't do:
+- Obsidian 1.5.7 or later; the mobile runtime requires Web Crypto. Keep Obsidian updated.
+- Desktop: Git on PATH. Local Gobog rendering and WeChat integration are desktop features.
+- Mobile: an existing GitHub source repository/branch and a Token with Contents read/write permission for that repository. Do not put tokens in a public repository.
 
-- It doesn't render or publish HTML. That's the github.io repo's
-  workflow, which builds the gobog binary at deploy time.
-- It doesn't bundle git — uses the system `git` from `PATH`.
-- It doesn't work on mobile (Electron-only APIs).
-
-## Requirements
-
-- Obsidian 1.4+ (desktop only).
-- `git` available on `PATH`.
-- A GitHub repository for the markdown source (e.g. `sbraveyoung/blog`)
-  and a Personal Access Token with `Contents: Read & Write` scoped to it.
-
-## Install
-
-For now, manual install:
+Build **outside your vault**, then package three runtime files:
 
 ```sh
-git clone https://github.com/sbraveyoung/gobog-obsidian.git \
-  <your-vault>/.obsidian/plugins/gobog-obsidian
-cd <your-vault>/.obsidian/plugins/gobog-obsidian
-npm install
+git clone https://github.com/sbraveyoung/gobog-obsidian.git /tmp/gobog-development
+cd /tmp/gobog-development
+npm ci
 npm run build
+node scripts/package-runtime.mjs /tmp/gobog-runtime
 ```
 
-Then in Obsidian: Settings → Community plugins → enable "Gobog Sync".
+Copy `main.js`, `manifest.json`, and `styles.css` to your vault's `.obsidian/plugins/gobog-obsidian`, preserving an existing `data.json`. Enable Gobog Sync in Community plugins. Do not install `node_modules`, source code or Git metadata in the vault; they create unnecessary synchronization work.
 
-## Configure
+## Configure and publish
 
-Open Settings → Gobog Sync.
+Set the blog folder, repository URL, branch, GitHub Token, author identity and optional site URL. Site URL allows the image audit to recognize same-site absolute links. New articles are drafts (`draft:true`, `publish:false`).
 
-| Section | Field | Notes |
-| --- | --- | --- |
-| Vault | Blog folder | Path inside the vault that mirrors the blog repo (e.g. `Blog`). |
-| Git remote | Repository URL | `https://github.com/<owner>/<repo>.git` |
-| | Branch | `master` for the existing blog repo. |
-| | GitHub token | Fine-grained PAT (Contents: Read & Write). Stored locally. |
-| | Git author name / email | Identity used for commits made by this plugin. |
-| Sync behavior | Pull on plugin start | Fast-forward your vault when Obsidian opens. Default on. |
-| | Auto-push on save | Commit + push automatically after every save (debounced). Default off. |
-| | Auto-push debounce | Seconds of quiet before the push fires. Default 30. |
-| | Commit template | Supports `{{date}}`, `{{count}}`, `{{paths}}`. |
-| Front matter | Auto-fill on create | Prepend a YAML block when a new note is created in the blog folder. |
-| | Default author | Used in the auto-filled `author:` field. |
-| | URL pattern | Used for posts. `{{id}}` is replaced with the auto-generated id. |
+1. Write in `blog/post/` or direct children of `blog/pages/`.
+2. Use **编辑文章属性与发表状态** to edit metadata or explicitly prepare publication. Hidden/private flags and parent restrictions remain in effect.
+3. Use **Push blog repo** to inspect the file list, properties and body diffs, then confirm the reviewed batch. File selection changes what you inspect, not the upload scope.
+4. Source commit success and website deployment success are reported separately.
 
-## Commands
+Mobile always uses manual network operations: desktop startup Pull and automatic Push settings are ignored on phones. The first mobile comparison has no device baseline, so review differing files carefully before establishing one. Later comparisons distinguish local edits, incoming changes and conflicts. Missing files may be waiting for iCloud and are never inferred to be remote deletions. Use manual Pull for incoming changes; divergent local content is preserved and reported.
 
-Command palette:
+Mobile imports referenced vault images outside blog only after review. Stable content-based resource names avoid name collisions, and corresponding links/cover paths appear in the diff. Single blobs over 20 MiB and Markdown over 2 MiB cannot be reviewed on mobile; use desktop for those. Verified unchanged binary files have a device-local hash cache invalidated by file events/metadata changes. The device baseline/cache never enters the source repo.
 
-- **Gobog Sync: Pull blog repo** — fetch + fast-forward.
-- **Gobog Sync: Push blog repo** — commit local changes + push.
-- **Gobog Sync: Show sync status** — quick "clean / N changed files" notice.
-- **Gobog Sync: Fill front matter for the active file** — re-runs the
-  auto-fill on demand (useful for files that pre-date the plugin).
-- **Gobog Sync: Preview blog locally** — runs the configured gobog
-  binary against the blog folder and opens the rendered output in your
-  default browser. If a post is open it opens that specific URL.
-  Requires `gobog binary path` in settings.
-- **Gobog Sync: Push active post to WeChat (公众号) as draft** —
-  submits the current note to the WeChat MP draft box. Only visible
-  when WeChat integration is enabled in settings.
+Desktop reconciles a mobile commit even when iCloud has already copied its content into the working tree. Unrelated drafts/staging are preserved; divergent commits or conflicting staged versions stop synchronization. Cancel restores the prior staging state. File/index changes during review require a refreshed diff.
 
-## Diff confirmation
+## Article properties and time
 
-By default every push (manual or auto) opens a modal showing
-a per-file review of the staged changes and the proposed commit message. The window has a searchable file list, addition/deletion counts, metadata before/after tables, publication and folder-policy notices, and colored body hunks with line numbers. Markdown properties are separate from the body by default; enable **包含属性原文** to inspect the raw header, or **展开全部上下文** to see the surrounding article. Large hunks load more rows on demand rather than truncating the whole review. Binary attachments are listed explicitly.
+The property editor manages title, author, description, category, tags, cover, chapter `order`, pin, AI marker and publication switches. Permanent id/url and dates are displayed without automatic regeneration. Unknown YAML properties/comments and body bytes are preserved. Configurable new-note defaults affect new articles only; new notes remain drafts.
 
-**提交并推送** commits and pushes every staged file; selecting a file only chooses what to inspect. **取消** (or closing the modal) unstages changes and leaves your files untouched. The review uses immutable Git snapshots, so edits made while the modal is open are not silently added to the commit. If another process changes the staged tree, the push aborts and asks you to review again. Publication notices describe article switches; parent folder rules and a successful website deployment still determine public visibility.
+With **正文编辑时自动更新文章时间** enabled, real Obsidian body edits refresh `updated_time` after a short debounce. Chinese composition is handled after completion. Metadata-only edits, opening, renaming, Git Pull and iCloud changes do not refresh it. `create_time` remains unchanged; disable the setting for manual historical dates. Pending updates finish before Push captures its review snapshot. Existing date format is retained; the renderer's legacy timezone interpretation has not been migrated.
 
-To turn the confirmation off, use
-**Settings → Gobog Sync → Confirm diff before each push**.
+Preflight reports invalid YAML, conflicting IDs/URLs, unsafe routes, invalid order and folder policies. Historical compatible property formats are warnings rather than silent rewrites. Correct hard errors before Push.
+
+## Image audit and cleanup
+
+Run **扫描 blog 图片引用并生成清单**. It scans on demand, covering all visible vault notes (including drafts/hidden/private content), Canvas, cover fields, Markdown/wiki references, HTML/srcset, CSS and Obsidian theme/snippet/plugin configuration. This is a current reference scan, not proof an image was never used in the past.
+
+The report labels images **被引用**, **疑似未引用**, or **无法确认**, with sizes and references. It supports filtering, size sorting and lazy previews. Markdown/JSON reports are saved under `.obsidian/plugins/gobog-obsidian/reports/`, outside blog and source commits. An incomplete or changing scan cannot authorize cleanup; cancel with **取消图片扫描**.
+
+No image is preselected or automatically deleted. Select candidates and confirm a second dialog; the plugin rechecks references/content/remote versions before moving selected images to vault-root `.trash`, outside blog. Restore files from `.trash` if needed. Mobile records explicit, version-bound delete intent; Push shows deletions again. Restoring an image cancels its pending delete intent. Cleanup does not purge old Git history or automatically reduce full-clone size.
 
 ## WeChat 公众号 (optional)
 

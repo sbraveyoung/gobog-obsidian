@@ -1,0 +1,4 @@
+const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
+test('runtime package contains only installable files and never overwrites an existing destination',t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'gobog-package-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));const target=path.join(root,'runtime');const p=spawnSync(process.execPath,['scripts/package-runtime.mjs',target],{encoding:'utf8'});assert.equal(p.status,0,p.stderr);assert.deepEqual(fs.readdirSync(target).sort(),['main.js','manifest.json','styles.css']);fs.writeFileSync(path.join(target,'data.json'),'keep');const again=spawnSync(process.execPath,['scripts/package-runtime.mjs',target],{encoding:'utf8'});assert.notEqual(again.status,0);assert.equal(fs.readFileSync(path.join(target,'data.json'),'utf8'),'keep');
+});
